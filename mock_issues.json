@@ -1,0 +1,48 @@
+{
+  "issues": [
+    {
+      "id": "issue_1",
+      "identifier": "SYM-1",
+      "title": "Build mock tracker wiring",
+      "description": "Use local tracker fixture instead of Linear for dev loops.",
+      "priority": 1,
+      "state": {
+        "name": "Todo"
+      },
+      "labels": {
+        "nodes": [
+          {
+            "name": "agent"
+          }
+        ]
+      },
+      "blockedBy": {
+        "nodes": []
+      },
+      "createdAt": "2026-03-05T00:00:00Z",
+      "updatedAt": "2026-03-05T00:00:00Z"
+    },
+    {
+      "id": "issue_2",
+      "identifier": "SYM-2",
+      "title": "Record completed fixture issue",
+      "description": "Terminal issue used by the orchestrator done-state checks.",
+      "priority": 2,
+      "state": {
+        "name": "Done"
+      },
+      "labels": {
+        "nodes": [
+          {
+            "name": "done"
+          }
+        ]
+      },
+      "blockedBy": {
+        "nodes": []
+      },
+      "createdAt": "2026-03-05T00:00:00Z",
+      "updatedAt": "2026-03-05T00:00:00Z"
+    }
+  ]
+}

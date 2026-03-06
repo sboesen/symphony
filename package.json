@@ -1,0 +1,12 @@
+{
+  "name": "symphony-artifacts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "record-issue-video": "node scripts/record_issue_video.mjs",
+    "record-scroll-video": "node scripts/record_scroll_video.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.58.2"
+  }
+}

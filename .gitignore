@@ -1,0 +1,8 @@
+/.DS_Store
+/_build/
+/deps/
+/node_modules/
+/artifacts/
+/.elixir_ls/
+/cover/
+/tmp/
