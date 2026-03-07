@@ -7,6 +7,9 @@ defmodule Symphony.ArtifactRecorder do
 
   @default_output_dir ".symphony/artifacts/recordings"
   @manifest_filename "manifest.json"
+  @demo_plan_rel_path ".git/symphony/demo-plan.json"
+  @capture_retry_attempts 3
+  @capture_retry_backoff_ms 1_000
 
   @spec capture(struct(), integer() | nil, Path.t(), Symphony.Config.t()) ::
           {:ok, [map()]} | {:error, term(), [map()]}
@@ -22,37 +25,58 @@ defmodule Symphony.ArtifactRecorder do
            {:ok, wait_for_selector} <-
              render_optional(config.recording_wait_for_selector, issue, attempt),
            {:ok, wait_for_text} <- render_optional(config.recording_wait_for_text, issue, attempt),
-           {:ok, output_dir} <- ensure_output_dir(workspace_path, config.recording_output_dir) do
+           {:ok, recording_output_dir} <-
+             render_optional(config.recording_output_dir, issue, attempt),
+           {:ok, output_dir} <- ensure_output_dir(workspace_path, recording_output_dir) do
         normalized_url = normalize_target_url(target_url, workspace_path)
         normalized_ready_url = normalize_ready_url(ready_url, normalized_url, workspace_path)
 
         setup_result =
-          case maybe_run_command(setup_command, workspace_path, config.hooks_timeout_ms, :setup) do
-            :ok -> :ok
+          case maybe_start_managed_command(
+                 setup_command,
+                 workspace_path,
+                 config.hooks_timeout_ms,
+                 :setup
+               ) do
+            {:ok, handle} -> {:ok, handle}
             {:error, reason} -> {:error, {:recording_setup_failed, reason}, []}
           end
 
         case setup_result do
-          :ok ->
+          {:ok, setup_handle} ->
+            Logger.info("recording capture setup started for #{issue.identifier} in #{workspace_path}")
+
             capture_result =
               try do
+                demo_plan_path = existing_demo_plan_path(workspace_path)
+
                 with :ok <-
                        wait_until_ready(normalized_ready_url, config.recording_ready_timeout_ms),
+                     _ <- Logger.info("recording target ready for #{issue.identifier}: #{normalized_ready_url}"),
                      {:ok, artifact} <-
-                       run_playwright_capture(
+                       capture_with_retry(
                          normalized_url,
                          wait_for_selector,
                          wait_for_text,
+                         demo_plan_path,
                          output_dir,
-                         config
+                         config,
+                         @capture_retry_attempts
                        ) do
                   {:ok, [artifact]}
                 else
+                  {:error, reason, artifact} ->
+                    failure_artifact = artifact || failed_artifact(normalized_url, output_dir, reason)
+                    {:error, reason, [failure_artifact]}
+
                   {:error, reason} ->
                     failure_artifact = failed_artifact(normalized_url, output_dir, reason)
                     {:error, reason, [failure_artifact]}
                 end
               after
+               _ = Symphony.Shell.stop_managed_script(setup_handle, config.hooks_timeout_ms)
+                Logger.info("recording setup stopped for #{issue.identifier}")
+
                 _ =
                   maybe_run_command(
                     teardown_command,
@@ -172,6 +196,19 @@ defmodule Symphony.ArtifactRecorder do
     end
   end
 
+  defp maybe_start_managed_command(nil, _workspace_path, _timeout_ms, _stage), do: {:ok, nil}
+
+  defp maybe_start_managed_command(command, workspace_path, timeout_ms, stage) do
+    case Symphony.Shell.start_managed_script(command, workspace_path, timeout_ms) do
+      {:ok, handle} ->
+        {:ok, handle}
+
+      {:error, reason} ->
+        Logger.warning("recording #{stage} command failed to start: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
   defp wait_until_ready(url, timeout_ms) when is_binary(url) do
     deadline = System.monotonic_time(:millisecond) + max(1_000, timeout_ms)
     do_wait_until_ready(url, deadline)
@@ -216,7 +253,14 @@ defmodule Symphony.ArtifactRecorder do
     end
   end
 
-  defp run_playwright_capture(url, wait_for_selector, wait_for_text, output_dir, config) do
+  defp run_playwright_capture(
+         url,
+         wait_for_selector,
+         wait_for_text,
+         demo_plan_path,
+         output_dir,
+         config
+       ) do
     script_path = Path.expand("scripts/record_issue_video.mjs", File.cwd!())
 
     args =
@@ -237,6 +281,7 @@ defmodule Symphony.ArtifactRecorder do
       ]
       |> maybe_append("--wait-for-selector", wait_for_selector)
       |> maybe_append("--wait-for-text", wait_for_text)
+      |> maybe_append("--plan-file", demo_plan_path)
 
     timeout_ms =
       max(
@@ -249,19 +294,105 @@ defmodule Symphony.ArtifactRecorder do
         System.cmd("node", args, stderr_to_stdout: true)
       end)
 
+    Logger.info("starting Playwright capture for #{url} into #{output_dir}")
+
     case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
       {:ok, {_output, 0}} ->
+        Logger.info("Playwright capture finished successfully for #{url}")
         read_manifest(output_dir)
 
       {:ok, {output, status}} ->
-        {:error, {:recording_command_failed, status, String.trim(output)}}
+        Logger.warning("Playwright capture failed for #{url} with status #{status}")
+        case read_manifest(output_dir) do
+          {:ok, artifact} ->
+            {:error, {:recording_command_failed, status, String.trim(output)}, artifact}
+
+          _ ->
+            {:error, {:recording_command_failed, status, String.trim(output)}}
+        end
 
       nil ->
+        Logger.warning("Playwright capture timed out for #{url}")
         {:error, :recording_command_timeout}
     end
   rescue
     error ->
       {:error, {:recording_command_exception, Exception.message(error)}}
+  end
+
+  defp capture_with_retry(url, wait_for_selector, wait_for_text, demo_plan_path, output_dir, config, attempts_left) do
+    case run_playwright_capture(
+           url,
+           wait_for_selector,
+           wait_for_text,
+           demo_plan_path,
+           output_dir,
+           config
+         ) do
+      {:ok, _artifact} = ok ->
+        ok
+
+      {:error, reason, _artifact} = error ->
+        maybe_retry_capture(
+          error,
+          reason,
+          attempts_left,
+          url,
+          wait_for_selector,
+          wait_for_text,
+          demo_plan_path,
+          output_dir,
+          config
+        )
+
+      {:error, reason} = error ->
+        maybe_retry_capture(
+          error,
+          reason,
+          attempts_left,
+          url,
+          wait_for_selector,
+          wait_for_text,
+          demo_plan_path,
+          output_dir,
+          config
+        )
+
+      error ->
+        error
+    end
+  end
+
+  defp maybe_retry_capture(error, reason, attempts_left, url, wait_for_selector, wait_for_text, demo_plan_path, output_dir, config) do
+    if attempts_left > 1 and retryable_capture_reason?(reason) do
+      Logger.warning(
+        "recording capture attempt failed, retrying (remaining=#{attempts_left - 1}): #{inspect(reason)}"
+      )
+
+      Process.sleep(@capture_retry_backoff_ms)
+
+      capture_with_retry(
+        url,
+        wait_for_selector,
+        wait_for_text,
+        demo_plan_path,
+        output_dir,
+        config,
+        attempts_left - 1
+      )
+    else
+      error
+    end
+  end
+
+  defp retryable_capture_reason?(reason) do
+    rendered = inspect(reason)
+
+    rendered =~ "recording_command_timeout" or
+      rendered =~ "recording_command_exception" or
+      rendered =~ "recording_manifest_failed" or
+      rendered =~ "recording_manifest_malformed" or
+      rendered =~ "recording_ready_timeout"
   end
 
   defp read_manifest(output_dir) do
@@ -272,12 +403,21 @@ defmodule Symphony.ArtifactRecorder do
       {:ok,
        %{
          kind: "video_recording",
-         status: "ready",
+         status: decoded["status"] || "ready",
          source_url: decoded["source_url"],
          output_dir: decoded["output_dir"],
          video_path: decoded["video_path"],
+         raw_video_path: decoded["raw_video_path"],
          trace_path: decoded["trace_path"],
          screenshot_path: decoded["screenshot_path"],
+         verification_path: decoded["verification_path"],
+         demo_plan_path: decoded["demo_plan_path"],
+         assertions: decoded["assertions"] || [],
+         verification: decoded["verification"] || %{},
+         non_demoable: decoded["non_demoable"] || false,
+         non_demoable_reason: decoded["non_demoable_reason"],
+         console_errors: decoded["console_errors"] || [],
+         error: decoded["error"],
          captured_at: decoded["captured_at"]
        }}
     else
@@ -296,11 +436,23 @@ defmodule Symphony.ArtifactRecorder do
       source_url: url,
       output_dir: output_dir,
       video_path: nil,
+      raw_video_path: nil,
       trace_path: nil,
       screenshot_path: nil,
+      verification_path: nil,
+      assertions: [],
+      verification: %{},
+      non_demoable: false,
+      non_demoable_reason: nil,
+      console_errors: [],
       captured_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
       error: inspect(reason)
     }
+  end
+
+  defp existing_demo_plan_path(workspace_path) do
+    path = Path.join(workspace_path, @demo_plan_rel_path)
+    if File.exists?(path), do: path, else: nil
   end
 
   defp maybe_append(args, _flag, nil), do: args

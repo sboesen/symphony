@@ -36,6 +36,14 @@ defmodule Symphony.Orchestrator do
     GenServer.call(__MODULE__, {:issue_status, issue_identifier})
   end
 
+  def current_config do
+    GenServer.call(__MODULE__, :current_config)
+  end
+
+  def external_event(type, issue_identifier, details \\ %{}) do
+    GenServer.call(__MODULE__, {:external_event, type, issue_identifier, details})
+  end
+
   def refresh do
     GenServer.call(__MODULE__, :refresh)
   end
@@ -87,6 +95,15 @@ defmodule Symphony.Orchestrator do
 
   def handle_call({:issue_status, issue_identifier}, _from, state) do
     {:reply, issue_status_payload(state, issue_identifier), state}
+  end
+
+  def handle_call(:current_config, _from, state) do
+    {:reply, state.config, state}
+  end
+
+  def handle_call({:external_event, type, issue_identifier, details}, _from, state) do
+    state = log_event(state, type, issue_identifier, details)
+    {:reply, :ok, state}
   end
 
   def handle_call(:refresh, _from, state) do
@@ -193,7 +210,7 @@ defmodule Symphony.Orchestrator do
         state =
           case result do
             {:ok, _payload} ->
-              case Tracker.mark_completed(state.config, issue_id) do
+              case Tracker.mark_in_review(state.config, issue_id) do
                 :ok ->
                   log_event(state, "tracker_marked_in_review", entry.issue_identifier, %{
                     issue_id: issue_id
@@ -296,6 +313,26 @@ defmodule Symphony.Orchestrator do
             _ ->
               state
           end
+
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:agent_runtime_event, issue_id, type, details}, state) do
+    case Map.get(state.running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      entry ->
+        updated_entry =
+          entry
+          |> Map.put(:last_codex_timestamp, System.monotonic_time(:millisecond))
+          |> Map.put(:last_update_type, to_string(type))
+
+        state =
+          state
+          |> Map.put(:running, Map.put(state.running, issue_id, updated_entry))
+          |> log_event(type, entry.issue_identifier, details)
 
         {:noreply, state}
     end
@@ -701,15 +738,16 @@ defmodule Symphony.Orchestrator do
   end
 
   defp reconcile_stalled_runs(state) do
-    timeout = state.config.stall_timeout_ms
+    base_timeout = state.config.stall_timeout_ms
 
-    if timeout <= 0 do
+    if base_timeout <= 0 do
       state
     else
       now = System.monotonic_time(:millisecond)
 
       Enum.reduce(state.running, state, fn {issue_id, entry}, acc ->
         last = entry.last_codex_timestamp
+        timeout = stall_timeout_for_entry(entry, base_timeout)
 
         if is_integer(last) and now - last > timeout do
           stop_issue(acc, issue_id, false, "stalled")
@@ -717,6 +755,24 @@ defmodule Symphony.Orchestrator do
           acc
         end
       end)
+    end
+  end
+
+  defp stall_timeout_for_entry(entry, base_timeout) do
+    type = to_string(entry.last_update_type || "")
+
+    cond do
+      type == "demo_capture_started" ->
+        max(base_timeout * 4, 180_000)
+
+      type == "demo_capture_repair_requested" ->
+        max(base_timeout * 2, 120_000)
+
+      String.starts_with?(type, "demo_capture_") ->
+        max(base_timeout * 2, 120_000)
+
+      true ->
+        base_timeout
     end
   end
 
@@ -936,6 +992,7 @@ defmodule Symphony.Orchestrator do
       attempt: run.attempt,
       error: run.error,
       artifacts: run.artifacts,
+      demo: summarize_demo(run.artifacts),
       issue: run.issue,
       routing: run.routing,
       workspace_path: run.workspace_path,
@@ -966,7 +1023,10 @@ defmodule Symphony.Orchestrator do
       review_pr_enabled: config.review_pr_enabled,
       review_pr_draft: config.review_pr_draft,
       review_pr_base_branch: config.review_pr_base_branch,
-      review_pr_auto_merge: config.review_pr_auto_merge
+      review_pr_auto_merge: config.review_pr_auto_merge,
+      github_webhook_auto_register: config.github_webhook_auto_register,
+      github_webhook_provider: config.github_webhook_provider,
+      github_webhook_repo: config.github_webhook_repo
     }
   end
 
@@ -1066,6 +1126,29 @@ defmodule Symphony.Orchestrator do
   end
 
   defp summarize_issue(_), do: nil
+
+  defp summarize_demo(artifacts) when is_list(artifacts) do
+    case Enum.find(artifacts, &(&1[:kind] == "video_recording" or &1["kind"] == "video_recording")) do
+      nil ->
+        nil
+
+      artifact ->
+        verification = artifact[:verification] || artifact["verification"] || %{}
+        results = verification[:results] || verification["results"] || []
+
+        %{
+          status: artifact[:status] || artifact["status"],
+          demo_plan_path: artifact[:demo_plan_path] || artifact["demo_plan_path"],
+          non_demoable: artifact[:non_demoable] || artifact["non_demoable"] || false,
+          non_demoable_reason: artifact[:non_demoable_reason] || artifact["non_demoable_reason"],
+          assertion_count: length(results),
+          assertion_failures: Enum.count(results, &((&1[:passed] || &1["passed"]) != true)),
+          error: artifact[:error] || artifact["error"]
+        }
+    end
+  end
+
+  defp summarize_demo(_), do: nil
 
   defp summarize_events(events), do: Enum.map(events, &summarize_event/1)
 

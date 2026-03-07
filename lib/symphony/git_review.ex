@@ -140,32 +140,36 @@ defmodule Symphony.GitReview do
   end
 
   defp checkout_review_branch(workspace_path, branch, base_branch) do
+    if current_branch(workspace_path) == branch do
+      :ok
+    else
     remote_exists? =
       case run_git(workspace_path, ["ls-remote", "--heads", "origin", branch]) do
         {:ok, output} -> String.trim(output) != ""
         _ -> false
       end
 
-    cond do
-      remote_exists? ->
-        with {:ok, _} <- run_git(workspace_path, ["fetch", "origin", branch]),
-             {:ok, _} <- run_git(workspace_path, ["checkout", "-B", branch, "origin/" <> branch]) do
-          :ok
-        end
-
-      true ->
-        _ = run_git(workspace_path, ["fetch", "origin", base_branch])
-
-        base_ref =
-          case run_git(workspace_path, ["rev-parse", "--verify", "origin/" <> base_branch]) do
-            {:ok, _} -> "origin/" <> base_branch
-            _ -> "HEAD"
+      cond do
+        remote_exists? ->
+          with {:ok, _} <- run_git(workspace_path, ["fetch", "origin", branch]),
+               {:ok, _} <- run_git(workspace_path, ["checkout", "-B", branch, "origin/" <> branch]) do
+            :ok
           end
 
-        case run_git(workspace_path, ["checkout", "-B", branch, base_ref]) do
-          {:ok, _} -> :ok
-          {:error, reason} -> {:error, reason}
-        end
+        true ->
+          _ = run_git(workspace_path, ["fetch", "origin", base_branch])
+
+          base_ref =
+            case run_git(workspace_path, ["rev-parse", "--verify", "origin/" <> base_branch]) do
+              {:ok, _} -> "origin/" <> base_branch
+              _ -> "HEAD"
+            end
+
+          case run_git(workspace_path, ["checkout", "-B", branch, base_ref]) do
+            {:ok, _} -> :ok
+            {:error, reason} -> {:error, reason}
+          end
+      end
     end
   end
 
@@ -206,7 +210,7 @@ defmodule Symphony.GitReview do
     case find_existing_pr(workspace_path, repo_slug, branch_info.branch) do
       {:ok, pr} ->
         _ = update_pr(workspace_path, repo_slug, pr.number, issue, branch_info, changed?)
-        {:ok, %{pr | created: false}}
+        {:ok, Map.put(pr, :created, false)}
 
       {:error, :pr_not_found} ->
         create_pr(workspace_path, repo_slug, issue, branch_info, changed?)
@@ -319,7 +323,9 @@ defmodule Symphony.GitReview do
 
       {:error, {:exit_status, _status, output}} when is_binary(output) ->
         if String.contains?(String.downcase(output), "auto-merge is not enabled") or
-             String.contains?(String.downcase(output), "not supported") do
+             String.contains?(String.downcase(output), "not supported") or
+             String.contains?(String.downcase(output), "clean status") or
+             String.contains?(output, "enablePullRequestAutoMerge") do
           merge_now(workspace_path, repo_slug, pr_number)
         else
           {:error, {:auto_merge_failed, output}}
