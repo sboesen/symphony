@@ -1,0 +1,14 @@
+[
+  {
+    "id": "TEST-1",
+    "identifier": "TEST-1",
+    "title": "Test issue",
+    "url": "https://linear.example/TEST-1",
+    "state": {
+      "name": "Todo",
+      "type": "unstarted"
+    },
+    "priority": 0,
+    "comments": []
+  }
+]

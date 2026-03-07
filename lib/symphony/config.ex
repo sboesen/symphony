@@ -276,7 +276,7 @@ defmodule Symphony.Config do
       is_nil(cfg.codex_command) or String.trim(cfg.codex_command) == "" ->
         {:error, :codex_command_missing}
 
-      cfg.recording_enabled and
+      cfg.recording_enabled == true and
           (is_nil(cfg.recording_url) or String.trim(cfg.recording_url) == "") ->
         {:error, :recording_url_missing}
 

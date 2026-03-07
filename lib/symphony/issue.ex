@@ -158,9 +158,20 @@ defmodule Symphony.Issue do
 
   defp get_in_flexible(payload, string_path, atom_paths) do
     value =
-      get_in(payload, string_path) ||
-        Enum.find_value(atom_paths, fn path -> get_in(payload, path) end)
+      get_path(payload, string_path) ||
+        Enum.find_value(atom_paths, fn path -> get_path(payload, path) end)
 
     if is_list(value), do: value, else: []
   end
+
+  defp get_path(value, []), do: value
+
+  defp get_path(%{} = value, [key | rest]) do
+    case Map.fetch(value, key) do
+      {:ok, next} -> get_path(next, rest)
+      :error -> nil
+    end
+  end
+
+  defp get_path(_, _path), do: nil
 end

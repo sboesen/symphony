@@ -3,11 +3,22 @@ defmodule Symphony.Application do
   use Application
 
   def start(_type, args) do
-    runtime = Symphony.CLI.parse_runtime_args(System.argv())
+    runtime =
+      if Code.ensure_loaded?(Mix) and Mix.env() == :test do
+        Symphony.CLI.parse_runtime_args([])
+      else
+        Symphony.CLI.parse_runtime_args(System.argv())
+      end
+
     _ = Symphony.CLI.apply_runtime_overrides(runtime)
+
+    configured_workflow_path =
+      Application.get_env(:symphony, __MODULE__, [])
+      |> Keyword.get(:workflow_path)
 
     workflow_path =
       Keyword.get(args, :workflow_path) ||
+        configured_workflow_path ||
         runtime.workflow_path ||
         "./WORKFLOW.md"
 

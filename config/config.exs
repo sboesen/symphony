@@ -8,3 +8,5 @@ config :symphony, Symphony.Application,
 
 # Finch is used for linear API calls.
 config :symphony, :finch_name, Symphony.Finch
+
+import_config "#{config_env()}.exs"
