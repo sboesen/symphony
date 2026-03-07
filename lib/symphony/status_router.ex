@@ -218,6 +218,19 @@ defmodule Symphony.StatusRouter do
           .event:last-child { border-bottom: none; }
           .event-type { font-size: 13px; text-transform: uppercase; letter-spacing: .07em; color: var(--accent); }
           .event-time, .event-details { color: var(--muted); font-size: 13px; line-height: 1.4; }
+          .demo-block {
+            margin-top: 10px; padding: 12px; border-radius: 14px;
+            background: #f5ede2; border: 1px solid var(--line);
+          }
+          .demo-block strong { display: block; margin-bottom: 6px; }
+          .demo-grid {
+            display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 8px 14px; font-size: 13px; color: var(--muted);
+          }
+          .demo-links, .demo-failures { margin-top: 10px; font-size: 13px; color: var(--muted); }
+          .demo-links a { color: var(--accent-2); text-decoration: none; margin-right: 10px; }
+          .demo-links a:hover { text-decoration: underline; }
+          .demo-failures ul { margin: 8px 0 0; padding-left: 18px; }
           pre {
             margin: 8px 0 0; padding: 10px; overflow: auto; white-space: pre-wrap;
             background: #f5ede2; border-radius: 14px; border: 1px solid var(--line);
@@ -302,6 +315,50 @@ defmodule Symphony.StatusRouter do
             const retry = `<button class="secondary" data-action="retry" data-issue="${esc(identifier)}">Retry</button>`;
             const cancel = running ? `<button class="danger" data-action="cancel" data-issue="${esc(identifier)}">Cancel</button>` : '';
             return `<div class="actions" style="margin-top:10px;">${retry}${cancel}</div>`;
+          }
+
+          function renderDemo(demo) {
+            if (!demo) {
+              return '<div class="demo-block"><strong>Demo</strong><div class="meta">No demo artifact captured.</div></div>';
+            }
+
+            const passed = Math.max(0, (demo.assertion_count ?? 0) - (demo.assertion_failures ?? 0));
+            const links = [
+              demo.linear_asset_url ? `<a href="${esc(demo.linear_asset_url)}" target="_blank" rel="noreferrer">Linear asset</a>` : '',
+              demo.source_url ? `<a href="${esc(demo.source_url)}" target="_blank" rel="noreferrer">Source page</a>` : ''
+            ].filter(Boolean).join('');
+
+            const failed = Array.isArray(demo.failed_assertions) ? demo.failed_assertions : [];
+            const failedMarkup = failed.length
+              ? `
+                <div class="demo-failures">
+                  <strong>Failed assertions</strong>
+                  <ul>
+                    ${failed.map((item) => `<li>${esc(item.type || 'assertion')}${item.selector ? ` • ${esc(item.selector)}` : ''}${item.value !== undefined ? ` • expected ${esc(String(item.value))}` : ''}${item.actual !== undefined ? ` • actual ${esc(String(item.actual))}` : ''}${item.actual_url ? ` • url ${esc(item.actual_url)}` : ''}</li>`).join('')}
+                  </ul>
+                </div>
+              `
+              : '';
+
+            return `
+              <div class="demo-block">
+                <strong>Demo</strong>
+                <div class="demo-grid">
+                  <span>status: ${esc(demo.status || 'unknown')}</span>
+                  <span>assertions: ${esc(`${passed}/${demo.assertion_count ?? 0}`)}</span>
+                  <span>plan: ${esc(demo.demo_plan_path || 'n/a')}</span>
+                  <span>verification: ${esc(demo.verification_path || 'n/a')}</span>
+                  <span>video: ${esc(demo.video_path || 'n/a')}</span>
+                  <span>trace: ${esc(demo.trace_path || 'n/a')}</span>
+                  <span>screenshot: ${esc(demo.screenshot_path || 'n/a')}</span>
+                  <span>published: ${esc(demo.published ? 'yes' : 'no')}</span>
+                  <span>reason: ${esc(demo.non_demoable_reason || 'n/a')}</span>
+                  <span>error: ${esc(demo.error || 'none')}</span>
+                </div>
+                ${links ? `<div class="demo-links">${links}</div>` : ''}
+                ${failedMarkup}
+              </div>
+            `;
           }
 
           function renderStats(status) {
@@ -404,12 +461,9 @@ defmodule Symphony.StatusRouter do
                     completed: ${esc(fmtTs(item.completed_at_ms))}<br/>
                     provider: ${esc(item.routing?.provider || 'n/a')}<br/>
                     model: ${esc(item.routing?.model || 'n/a')}<br/>
-                    demo: ${esc(item.demo?.status || 'none')}<br/>
-                    demo assertions: ${esc(item.demo ? `${(item.demo.assertion_count ?? 0) - (item.demo.assertion_failures ?? 0)}/${item.demo.assertion_count ?? 0}` : 'n/a')}<br/>
-                    demo plan: ${esc(item.demo?.demo_plan_path || 'n/a')}<br/>
-                    demo reason: ${esc(item.demo?.non_demoable_reason || 'n/a')}<br/>
                     error: ${esc(item.error || 'none')}
                   </div>
+                  ${renderDemo(item.demo)}
                   ${item.artifacts?.length ? `<pre>${esc(JSON.stringify(item.artifacts, null, 2))}</pre>` : ''}
                   ${actionButtons(item.identifier, false)}
                 </article>

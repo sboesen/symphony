@@ -1135,6 +1135,8 @@ defmodule Symphony.Orchestrator do
       artifact ->
         verification = artifact[:verification] || artifact["verification"] || %{}
         results = verification[:results] || verification["results"] || []
+        failed_results =
+          Enum.filter(results, fn result -> (result[:passed] || result["passed"]) != true end)
 
         %{
           status: artifact[:status] || artifact["status"],
@@ -1143,12 +1145,34 @@ defmodule Symphony.Orchestrator do
           non_demoable_reason: artifact[:non_demoable_reason] || artifact["non_demoable_reason"],
           assertion_count: length(results),
           assertion_failures: Enum.count(results, &((&1[:passed] || &1["passed"]) != true)),
+          failed_assertions: Enum.map(failed_results, &summarize_assertion_failure/1),
+          verification_path: artifact[:verification_path] || artifact["verification_path"],
+          video_path: artifact[:video_path] || artifact["video_path"],
+          screenshot_path: artifact[:screenshot_path] || artifact["screenshot_path"],
+          trace_path: artifact[:trace_path] || artifact["trace_path"],
+          source_url: artifact[:source_url] || artifact["source_url"],
+          linear_asset_url: artifact[:linear_asset_url] || artifact["linear_asset_url"],
+          linear_attachment_id:
+            artifact[:linear_attachment_id] || artifact["linear_attachment_id"],
+          linear_comment_id: artifact[:linear_comment_id] || artifact["linear_comment_id"],
+          published: artifact[:published] || artifact["published"] || false,
           error: artifact[:error] || artifact["error"]
         }
     end
   end
 
   defp summarize_demo(_), do: nil
+
+  defp summarize_assertion_failure(result) do
+    %{
+      type: result[:type] || result["type"],
+      selector: result[:selector] || result["selector"],
+      value: result[:value] || result["value"],
+      actual: result[:actual] || result["actual"],
+      actual_url: result[:actual_url] || result["actual_url"],
+      actual_present: result[:actual_present] || result["actual_present"]
+    }
+  end
 
   defp summarize_events(events), do: Enum.map(events, &summarize_event/1)
 
