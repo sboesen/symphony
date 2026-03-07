@@ -5,6 +5,7 @@ defmodule Symphony.OpenCodeRunner do
       when is_function(on_update, 1) do
     deadline = System.monotonic_time(:millisecond) + max(1, config.turn_timeout_ms)
     read_timeout = max(100, config.read_timeout_ms)
+    stall_timeout = max(read_timeout, config.stall_timeout_ms || 300_000)
     model = resolve_model(routing[:model] || config.codex_model, routing[:provider])
     variant = resolve_variant(routing[:effort])
     {exe, base_args} = command_parts(config.codex_command)
@@ -33,7 +34,9 @@ defmodule Symphony.OpenCodeRunner do
       buffer: "",
       session_id: nil,
       error: nil,
-      terminal_reason: nil
+      terminal_reason: nil,
+      stall_timeout_ms: stall_timeout,
+      last_activity_ms: System.monotonic_time(:millisecond)
     }
 
     case await_completion(state, on_update) do
@@ -66,7 +69,11 @@ defmodule Symphony.OpenCodeRunner do
         {:ok, 0, state}
 
       System.monotonic_time(:millisecond) >= state.deadline_ms ->
-      {:error, :turn_timeout}
+        {:error, :turn_timeout}
+
+      stalled?(state) ->
+        {:error, :stall_timeout}
+
       true ->
         state = process_queue(state, on_update)
 
@@ -176,13 +183,17 @@ defmodule Symphony.OpenCodeRunner do
           {Enum.drop(parts, -1) |> Enum.reject(&(&1 == "")), List.last(parts) || ""}
       end
 
-    %{state | queue: state.queue ++ lines, buffer: buffer}
+    %{state | queue: state.queue ++ lines, buffer: buffer, last_activity_ms: System.monotonic_time(:millisecond)}
   end
 
   defp to_binary_chunk({:eol, line}), do: IO.iodata_to_binary(line) <> "\n"
   defp to_binary_chunk({:noeol, line}), do: IO.iodata_to_binary(line)
   defp to_binary_chunk(data) when is_binary(data), do: data
   defp to_binary_chunk(data), do: IO.iodata_to_binary(data)
+
+  defp stalled?(state) do
+    System.monotonic_time(:millisecond) - state.last_activity_ms >= state.stall_timeout_ms
+  end
 
   defp close_port(port) do
     if is_port(port) and Port.info(port) != nil do

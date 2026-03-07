@@ -27,31 +27,48 @@ codex:
   command: codex app-server
   providers:
     zai:
-      backend: opencode_server
-      command: opencode serve
+      backend: opencode
+      command: opencode
       auth_mode: api_key
       api_key: $Z_API_KEY
       base_url: https://api.z.ai/api/coding/paas/v4
       model: zai-coding-plan/glm-5
     codex:
-      backend: opencode_server
-      command: opencode serve
+      backend: codex_app_server
+      command: codex app-server
       auth_mode: app_server
-      model: openai/gpt-5.3-codex
+      model: codex-5-3
   router:
     enabled: true
     default_provider: zai
     hard_provider: codex
     default_model: zai-coding-plan/glm-5
-    hard_model: openai/gpt-5.3-codex
+    hard_model: codex-5-3
     hard_effort: xhigh
     hard_percentile: 95
 server:
   port: 4012
+  # The operator dashboard and status APIs are local-only by design.
+  # There is no built-in auth layer yet, so do not expose this port to untrusted networks.
+github:
+  webhook:
+    # Local webhook ingress is handled by an embedded broker inside Symphony.
+    # Only one public endpoint is created per machine/process group, and later
+    # Symphony sessions register with that broker over localhost.
+    # When auto_register is enabled, Symphony will delete stale Symphony-managed
+    # GitHub webhooks for this repo before creating the current one.
+    secret: $GITHUB_WEBHOOK_SECRET
+    auto_register: $SYMPHONY_GITHUB_WEBHOOK_AUTO_REGISTER
+    provider: ngrok
+    repo: $GITHUB_WEBHOOK_REPO
 recording:
   enabled: false
   url: http://127.0.0.1:3000
   ready_url: http://127.0.0.1:3000
+  # When recording is enabled, the agent is expected to write a feature-specific
+  # demo plan to `.git/symphony/demo-plan.json`. The recorder will execute those
+  # steps instead of doing a generic page capture. The plan can also declare
+  # `non_demoable: true` for tasks that do not have a meaningful user-visible demo.
   output_dir: .symphony/artifacts/recordings
   wait_ms: 2500
   trace: true

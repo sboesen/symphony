@@ -56,13 +56,19 @@ defmodule Symphony.CLI do
 
     apply_runtime_overrides(parsed)
 
-    case Symphony.Application.start(nil, workflow_path: workflow_path) do
-      {:ok, _pid} ->
-        Process.sleep(:infinity)
+    case Process.whereis(Symphony.Supervisor) do
+      nil ->
+        case Symphony.Application.start(nil, workflow_path: workflow_path) do
+          {:ok, _pid} ->
+            Process.sleep(:infinity)
 
-      {:error, reason} ->
-        IO.puts("failed to start: #{inspect(reason)}")
-        System.halt(1)
+          {:error, reason} ->
+            IO.puts("failed to start: #{inspect(reason)}")
+            System.halt(1)
+        end
+
+      _pid ->
+        Process.sleep(:infinity)
     end
   end
 

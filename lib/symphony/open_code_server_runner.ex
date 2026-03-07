@@ -164,10 +164,12 @@ defmodule Symphony.OpenCodeServerRunner do
   end
 
   defp terminal_finish?(response) when is_map(response) do
-    case get_in(response, ["info", "finish"]) do
+    info = response["info"] || %{}
+
+    case info["finish"] do
       "stop" -> true
       "completed" -> true
-      _ -> false
+      _ -> not is_nil(info["error"])
     end
   end
 

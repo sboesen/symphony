@@ -63,7 +63,11 @@ defmodule Symphony.Config do
     :review_pr_enabled,
     :review_pr_draft,
     :review_pr_base_branch,
-    :review_pr_auto_merge
+    :review_pr_auto_merge,
+    :github_webhook_secret,
+    :github_webhook_auto_register,
+    :github_webhook_provider,
+    :github_webhook_repo
   ]
 
   def from_workflow(%Symphony.Workflow{config: config}) when is_map(config) do
@@ -79,6 +83,28 @@ defmodule Symphony.Config do
       resolve_env(cfg.(["codex", "zai_api_key"])) ||
         resolve_env(cfg.(["codex", "z_api_key"])) ||
         System.get_env("Z_API_KEY")
+
+    github_webhook_secret =
+      resolve_env(cfg.(["github", "webhook", "secret"])) ||
+        System.get_env("GITHUB_WEBHOOK_SECRET")
+
+    github_webhook_provider =
+      resolve_env(cfg.(["github", "webhook", "provider"])) || "ngrok"
+
+    github_webhook_repo =
+      resolve_env(cfg.(["github", "webhook", "repo"])) ||
+        github_repo_slug(System.get_env("GITHUB_REPO_URL"))
+
+    github_webhook_auto_register =
+      resolve_bool(
+        cfg.(["github", "webhook", "auto_register"]) ||
+          System.get_env("SYMPHONY_GITHUB_WEBHOOK_AUTO_REGISTER"),
+        default_github_webhook_auto_register(
+          github_webhook_secret,
+          github_webhook_repo,
+          github_webhook_provider
+        )
+      )
 
     openai_base_url =
       resolve_url(
@@ -196,7 +222,11 @@ defmodule Symphony.Config do
       review_pr_enabled: resolve_bool(cfg.(["review", "pr", "enabled"]), true),
       review_pr_draft: resolve_bool(cfg.(["review", "pr", "draft"]), false),
       review_pr_base_branch: resolve_text(cfg.(["review", "pr", "base_branch"])),
-      review_pr_auto_merge: resolve_bool(cfg.(["review", "pr", "auto_merge"]), true)
+      review_pr_auto_merge: resolve_bool(cfg.(["review", "pr", "auto_merge"]), true),
+      github_webhook_secret: github_webhook_secret,
+      github_webhook_auto_register: github_webhook_auto_register,
+      github_webhook_provider: github_webhook_provider,
+      github_webhook_repo: github_webhook_repo
     }
 
     parsed =
@@ -275,8 +305,8 @@ defmodule Symphony.Config do
         model_provider: model_provider,
         model: "GLM-5",
         auth_mode: "api_key",
-        backend: "opencode_server",
-        command: System.get_env("SYMPHONY_OPENCODE_COMMAND") || "opencode serve",
+        backend: "opencode",
+        command: System.get_env("SYMPHONY_OPENCODE_COMMAND") || "opencode",
         env: %{}
       },
       "codex" => %{
@@ -480,6 +510,13 @@ defmodule Symphony.Config do
 
   defp resolve_bool(_, fallback), do: fallback
 
+  defp default_github_webhook_auto_register(secret, repo, "ngrok")
+       when is_binary(secret) and secret != "" and is_binary(repo) and repo != "" do
+    not is_nil(System.find_executable("ngrok"))
+  end
+
+  defp default_github_webhook_auto_register(_secret, _repo, _provider), do: false
+
   defp positive_int(v, fallback), do: if(is_integer(v) and v > 0, do: v, else: fallback)
 
   defp resolve_url(nil, fallback), do: fallback
@@ -516,7 +553,11 @@ defmodule Symphony.Config do
     |> String.trim()
     |> case do
       "" -> nil
-      trimmed -> expand_env(trimmed)
+      trimmed ->
+        case resolve_env(trimmed) do
+          nil -> trimmed
+          resolved -> resolved
+        end
     end
   end
 
@@ -564,6 +605,28 @@ defmodule Symphony.Config do
   end
 
   defp normalize_map(_), do: %{}
+
+  defp github_repo_slug(nil), do: nil
+
+  defp github_repo_slug(value) when is_binary(value) do
+    normalized =
+      value
+      |> String.trim()
+      |> String.replace_suffix(".git", "")
+
+    cond do
+      Regex.match?(~r{^https://github\.com/[^/]+/[^/]+$}, normalized) ->
+        [_, owner, repo] = Regex.run(~r{^https://github\.com/([^/]+)/([^/]+)$}, normalized)
+        "#{owner}/#{repo}"
+
+      Regex.match?(~r{^git@github\.com:[^/]+/[^/]+$}, normalized) ->
+        [_, owner, repo] = Regex.run(~r{^git@github\.com:([^/]+)/([^/]+)$}, normalized)
+        "#{owner}/#{repo}"
+
+      true ->
+        nil
+    end
+  end
 
   defp resolve_workspace_root(nil), do: default_workspace_root()
 
