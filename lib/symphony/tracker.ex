@@ -3,9 +3,13 @@ defmodule Symphony.Tracker do
 
   def fetch_candidates(config), do: tracker_call(:fetch_candidates, config)
   def fetch_states_by_ids(config, ids), do: tracker_call(:fetch_states_by_ids, config, ids)
+  def fetch_issue_by_identifier(config, identifier),
+    do: tracker_call(:fetch_issue_by_identifier, config, identifier)
   def fetch_terminal_issues(config, states), do: tracker_call(:fetch_terminal_issues, config, states)
   def mark_started(config, issue_id), do: tracker_call(:mark_started, config, issue_id)
-  def mark_completed(config, issue_id), do: tracker_call(:mark_completed, config, issue_id)
+  def mark_in_review(config, issue_id), do: tracker_call(:mark_in_review, config, issue_id)
+  def mark_done(config, issue_id), do: tracker_call(:mark_done, config, issue_id)
+  def mark_completed(config, issue_id), do: mark_in_review(config, issue_id)
   def publish_artifacts(config, issue, artifacts), do: tracker_call(:publish_artifacts, config, {issue, artifacts})
   def publish_review_handoff(config, issue, review_artifact),
     do: tracker_call(:publish_review_handoff, config, {issue, review_artifact})
@@ -31,6 +35,10 @@ defmodule Symphony.Tracker do
     Symphony.Tracker.LinearClient.fetch_states_by_ids(config, maybe_list(args))
   end
 
+  defp dispatch_linear_call(:fetch_issue_by_identifier, config, identifier) do
+    Symphony.Tracker.LinearClient.fetch_issue_by_identifier(config, identifier)
+  end
+
   defp dispatch_linear_call(:fetch_terminal_issues, config, args) do
     Symphony.Tracker.LinearClient.fetch_terminal_issues(config, maybe_list(args))
   end
@@ -39,8 +47,12 @@ defmodule Symphony.Tracker do
     Symphony.Tracker.LinearClient.mark_started(config, issue_id)
   end
 
-  defp dispatch_linear_call(:mark_completed, config, issue_id) do
-    Symphony.Tracker.LinearClient.mark_completed(config, issue_id)
+  defp dispatch_linear_call(:mark_in_review, config, issue_id) do
+    Symphony.Tracker.LinearClient.mark_in_review(config, issue_id)
+  end
+
+  defp dispatch_linear_call(:mark_done, config, issue_id) do
+    Symphony.Tracker.LinearClient.mark_done(config, issue_id)
   end
 
   defp dispatch_linear_call(:publish_artifacts, config, {issue, artifacts}) do
@@ -61,6 +73,10 @@ defmodule Symphony.Tracker do
     Symphony.Tracker.MockClient.fetch_states_by_ids(config, maybe_list(args))
   end
 
+  defp dispatch_mock_call(:fetch_issue_by_identifier, config, identifier) do
+    Symphony.Tracker.MockClient.fetch_issue_by_identifier(config, identifier)
+  end
+
   defp dispatch_mock_call(:fetch_terminal_issues, config, args) do
     Symphony.Tracker.MockClient.fetch_terminal_issues(config, maybe_list(args))
   end
@@ -69,8 +85,12 @@ defmodule Symphony.Tracker do
     Symphony.Tracker.MockClient.mark_started(config, issue_id)
   end
 
-  defp dispatch_mock_call(:mark_completed, config, issue_id) do
-    Symphony.Tracker.MockClient.mark_completed(config, issue_id)
+  defp dispatch_mock_call(:mark_in_review, config, issue_id) do
+    Symphony.Tracker.MockClient.mark_in_review(config, issue_id)
+  end
+
+  defp dispatch_mock_call(:mark_done, config, issue_id) do
+    Symphony.Tracker.MockClient.mark_done(config, issue_id)
   end
 
   defp dispatch_mock_call(:publish_artifacts, _config, {_issue, artifacts}) do

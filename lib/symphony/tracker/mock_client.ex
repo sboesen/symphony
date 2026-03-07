@@ -26,12 +26,21 @@ defmodule Symphony.Tracker.MockClient do
     end
   end
 
+  def fetch_issue_by_identifier(config, identifier) when is_binary(identifier) do
+    wanted = String.trim(identifier)
+
+    with {:ok, issues} <- load_issues(config) do
+      {:ok, Enum.find(issues, &(&1.identifier == wanted))}
+    end
+  end
+
   def fetch_terminal_issues(config, terminal_states) do
     fetch_by_states(config, terminal_states)
   end
 
   def mark_started(_config, _issue_id), do: :ok
-  def mark_completed(_config, _issue_id), do: :ok
+  def mark_in_review(_config, _issue_id), do: :ok
+  def mark_done(_config, _issue_id), do: :ok
 
   defp fetch_by_states(config, states) do
     wanted_states = normalize_state_set(states)

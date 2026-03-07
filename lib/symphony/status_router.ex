@@ -4,7 +4,11 @@ defmodule Symphony.StatusRouter do
   use Plug.Router
   import Plug.Conn
 
-  plug(Plug.Parsers, parsers: [:urlencoded, :json], json_decoder: Jason)
+  plug(Plug.Parsers,
+    parsers: [:urlencoded, :json],
+    json_decoder: Jason,
+    body_reader: {__MODULE__, :read_body, []}
+  )
   plug(:match)
   plug(:dispatch)
 
@@ -64,8 +68,57 @@ defmodule Symphony.StatusRouter do
     respond_action(conn, Symphony.Orchestrator.cancel_issue(issue_identifier))
   end
 
+  post "/api/v1/github/webhook" do
+    case Symphony.GitHubWebhook.handle(conn, conn.body_params) do
+      {:ok, payload} ->
+        body = Jason.encode!(%{ok: true, payload: payload})
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, body)
+
+      {:error, reason} ->
+        body = Jason.encode!(%{ok: false, error: inspect(reason)})
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(422, body)
+    end
+  end
+
+  post "/api/v1/github/webhook/:session_id" do
+    case Symphony.GitHubWebhook.handle(conn, conn.body_params, session_id) do
+      {:ok, payload} ->
+        body = Jason.encode!(%{ok: true, payload: payload})
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, body)
+
+      {:error, reason} ->
+        body = Jason.encode!(%{ok: false, error: inspect(reason)})
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(422, body)
+    end
+  end
+
   match _ do
     send_resp(conn, 404, "not found")
+  end
+
+  def read_body(conn, opts) do
+    case Plug.Conn.read_body(conn, opts) do
+      {:ok, body, conn} ->
+        {:ok, body, assign(conn, :raw_body, body)}
+
+      {:more, body, conn} ->
+        {:more, body, assign(conn, :raw_body, body)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp respond_action(conn, {:ok, payload}) do
@@ -351,6 +404,10 @@ defmodule Symphony.StatusRouter do
                     completed: ${esc(fmtTs(item.completed_at_ms))}<br/>
                     provider: ${esc(item.routing?.provider || 'n/a')}<br/>
                     model: ${esc(item.routing?.model || 'n/a')}<br/>
+                    demo: ${esc(item.demo?.status || 'none')}<br/>
+                    demo assertions: ${esc(item.demo ? `${(item.demo.assertion_count ?? 0) - (item.demo.assertion_failures ?? 0)}/${item.demo.assertion_count ?? 0}` : 'n/a')}<br/>
+                    demo plan: ${esc(item.demo?.demo_plan_path || 'n/a')}<br/>
+                    demo reason: ${esc(item.demo?.non_demoable_reason || 'n/a')}<br/>
                     error: ${esc(item.error || 'none')}
                   </div>
                   ${item.artifacts?.length ? `<pre>${esc(JSON.stringify(item.artifacts, null, 2))}</pre>` : ''}

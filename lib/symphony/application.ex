@@ -14,7 +14,9 @@ defmodule Symphony.Application do
     children = [
       {Finch, name: Symphony.Finch},
       {Task.Supervisor, name: Symphony.TaskSupervisor},
-      {Symphony.Orchestrator, workflow_path: workflow_path}
+      {Symphony.Broker, []},
+      {Symphony.Orchestrator, workflow_path: workflow_path},
+      {Symphony.GitHubWebhookManager, []}
     ]
 
     opts = [strategy: :one_for_one, name: Symphony.Supervisor]

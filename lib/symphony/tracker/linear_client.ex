@@ -14,8 +14,12 @@ defmodule Symphony.Tracker.LinearClient do
     transition_issue_state(config, issue_id, "started")
   end
 
-  def mark_completed(config, issue_id) do
+  def mark_in_review(config, issue_id) do
     transition_issue_state(config, issue_id, "in_review")
+  end
+
+  def mark_done(config, issue_id) do
+    transition_issue_state(config, issue_id, "completed")
   end
 
   def publish_artifacts(config, %Issue{} = issue, artifacts) when is_list(artifacts) do
@@ -53,6 +57,47 @@ defmodule Symphony.Tracker.LinearClient do
     else
       nil -> {:ok, review_artifact}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def fetch_issue_by_identifier(config, identifier) when is_binary(identifier) do
+    query = """
+    query($identifier: String!) {
+      issues(filter: { identifier: { eq: $identifier } }, first: 1) {
+        nodes {
+          id
+          identifier
+          title
+          description
+          comments(first: 8) {
+            nodes {
+              id
+              body
+              createdAt
+              updatedAt
+              user { name }
+            }
+          }
+          priority
+          state { name }
+          branchName
+          url
+          labels { nodes { name } }
+          createdAt
+          updatedAt
+        }
+      }
+    }
+    """
+
+    with {:ok, payload} <-
+           execute_query(config, query, %{identifier: String.trim(identifier)}, &get_in(&1, ["data", "issues", "nodes"])),
+         [issue | _] <- payload do
+      {:ok, Issue.from_payload(issue)}
+    else
+      [] -> {:ok, nil}
+      {:error, _} = error -> error
+      _ -> {:error, :malformed_graphql}
     end
   end
 
