@@ -11,6 +11,7 @@ defmodule Symphony.Config do
     :tracker_mock_file,
     :tracker_active_states,
     :tracker_terminal_states,
+    :poll_enabled,
     :poll_interval_ms,
     :workspace_root,
     :hooks_after_create,
@@ -61,18 +62,22 @@ defmodule Symphony.Config do
     :recording_publish_to_tracker,
     :recording_publish_comment,
     :review_pr_enabled,
+    :review_required,
     :review_pr_draft,
     :review_pr_base_branch,
     :review_pr_auto_merge,
     :github_webhook_secret,
     :github_webhook_auto_register,
     :github_webhook_provider,
-    :github_webhook_repo
+    :github_webhook_repo,
+    :linear_webhook_secret,
+    :linear_webhook_auto_register
   ]
 
   def from_workflow(%Symphony.Workflow{config: config}) when is_map(config) do
     cfg = fn path -> get_in(config, path) end
     router = cfg.(["codex", "router"]) || %{}
+    no_review = resolve_bool(System.get_env("SYMPHONY_NO_REVIEW"), false)
 
     openai_api_key =
       resolve_env(cfg.(["codex", "api_key"])) ||
@@ -84,7 +89,7 @@ defmodule Symphony.Config do
         resolve_env(cfg.(["codex", "z_api_key"])) ||
         System.get_env("Z_API_KEY")
 
-    github_webhook_secret =
+    configured_github_webhook_secret =
       resolve_env(cfg.(["github", "webhook", "secret"])) ||
         System.get_env("GITHUB_WEBHOOK_SECRET")
 
@@ -94,6 +99,37 @@ defmodule Symphony.Config do
     github_webhook_repo =
       resolve_env(cfg.(["github", "webhook", "repo"])) ||
         github_repo_slug(System.get_env("GITHUB_REPO_URL"))
+
+    configured_linear_webhook_secret =
+      resolve_env(cfg.(["linear", "webhook", "secret"])) ||
+        System.get_env("LINEAR_WEBHOOK_SECRET")
+
+    webhook_secret =
+      configured_github_webhook_secret ||
+        configured_linear_webhook_secret ||
+        local_webhook_secret(
+          resolve_env(cfg.(["tracker", "api_key"])) || System.get_env("LINEAR_API_KEY"),
+          github_webhook_repo,
+          resolve_env(cfg.(["tracker", "project_slug"])) || System.get_env("LINEAR_PROJECT_SLUG")
+        )
+
+    github_webhook_secret = configured_github_webhook_secret || webhook_secret
+
+    linear_webhook_secret =
+      configured_linear_webhook_secret ||
+        github_webhook_secret ||
+        webhook_secret
+
+    linear_webhook_auto_register =
+      resolve_bool(
+        cfg.(["linear", "webhook", "auto_register"]) ||
+          System.get_env("SYMPHONY_LINEAR_WEBHOOK_AUTO_REGISTER"),
+        default_linear_webhook_auto_register(
+          linear_webhook_secret,
+          resolve_env(cfg.(["tracker", "project_slug"])) || System.get_env("LINEAR_PROJECT_SLUG"),
+          github_webhook_provider
+        )
+      )
 
     github_webhook_auto_register =
       resolve_bool(
@@ -150,6 +186,7 @@ defmodule Symphony.Config do
             "Done"
           ])
         ),
+      poll_enabled: resolve_bool(cfg.(["polling", "enabled"]), true),
       poll_interval_ms: resolve_int(cfg.(["polling", "interval_ms"]), 30_000),
       workspace_root: resolve_workspace_root(cfg.(["workspace", "root"])),
       hooks_after_create: cfg.(["hooks", "after_create"]),
@@ -215,18 +252,19 @@ defmodule Symphony.Config do
       recording_height: positive_int(resolve_int(cfg.(["recording", "height"]), 900), 900),
       recording_trace: resolve_bool(cfg.(["recording", "trace"]), true),
       recording_strict: resolve_bool(cfg.(["recording", "strict"]), false),
-      recording_publish_to_tracker:
-        resolve_bool(cfg.(["recording", "publish_to_tracker"]), true),
-      recording_publish_comment:
-        resolve_bool(cfg.(["recording", "publish_comment"]), true),
+      recording_publish_to_tracker: resolve_bool(cfg.(["recording", "publish_to_tracker"]), true),
+      recording_publish_comment: resolve_bool(cfg.(["recording", "publish_comment"]), true),
       review_pr_enabled: resolve_bool(cfg.(["review", "pr", "enabled"]), true),
+      review_required: resolve_bool(cfg.(["review", "required"]), not no_review),
       review_pr_draft: resolve_bool(cfg.(["review", "pr", "draft"]), false),
       review_pr_base_branch: resolve_text(cfg.(["review", "pr", "base_branch"])),
-      review_pr_auto_merge: resolve_bool(cfg.(["review", "pr", "auto_merge"]), true),
+      review_pr_auto_merge: resolve_bool(cfg.(["review", "pr", "auto_merge"]), no_review),
       github_webhook_secret: github_webhook_secret,
       github_webhook_auto_register: github_webhook_auto_register,
       github_webhook_provider: github_webhook_provider,
-      github_webhook_repo: github_webhook_repo
+      github_webhook_repo: github_webhook_repo,
+      linear_webhook_secret: linear_webhook_secret,
+      linear_webhook_auto_register: linear_webhook_auto_register
     }
 
     parsed =
@@ -262,6 +300,10 @@ defmodule Symphony.Config do
       cfg.tracker_kind == "linear" and
           (is_nil(cfg.tracker_project_slug) or String.trim(cfg.tracker_project_slug) == "") ->
         {:error, :tracker_project_slug_missing}
+
+      cfg.tracker_kind == "linear" and cfg.poll_enabled == false and
+          (is_nil(cfg.linear_webhook_secret) or String.trim(cfg.linear_webhook_secret) == "") ->
+        {:error, :linear_webhook_secret_missing}
 
       cfg.tracker_kind == "mock" and
           (is_nil(cfg.tracker_mock_file) or String.trim(cfg.tracker_mock_file) == "") ->
@@ -415,6 +457,7 @@ defmodule Symphony.Config do
   defp normalize_backend("open_code"), do: "opencode"
   defp normalize_backend("codex"), do: "codex_app_server"
   defp normalize_backend("codex_app_server"), do: "codex_app_server"
+  defp normalize_backend("codex_exec"), do: "codex_exec"
   defp normalize_backend("app_server"), do: "codex_app_server"
 
   defp normalize_backend(value) when is_binary(value) do
@@ -517,6 +560,18 @@ defmodule Symphony.Config do
 
   defp default_github_webhook_auto_register(_secret, _repo, _provider), do: false
 
+  defp default_linear_webhook_auto_register(secret, project_slug, "ngrok")
+       when is_binary(secret) and secret != "" and is_binary(project_slug) and project_slug != "" do
+    not is_nil(System.find_executable("ngrok"))
+  end
+
+  defp default_linear_webhook_auto_register(_secret, _project_slug, _provider), do: false
+
+  defp random_webhook_secret do
+    :crypto.strong_rand_bytes(32)
+    |> Base.url_encode64(padding: false)
+  end
+
   defp positive_int(v, fallback), do: if(is_integer(v) and v > 0, do: v, else: fallback)
 
   defp resolve_url(nil, fallback), do: fallback
@@ -552,7 +607,9 @@ defmodule Symphony.Config do
     value
     |> String.trim()
     |> case do
-      "" -> nil
+      "" ->
+        nil
+
       trimmed ->
         case resolve_env(trimmed) do
           nil -> trimmed
@@ -660,5 +717,25 @@ defmodule Symphony.Config do
 
   defp default_workspace_root do
     Path.join(System.tmp_dir!(), "symphony_workspaces")
+  end
+
+  defp local_webhook_secret(tracker_api_key, github_webhook_repo, tracker_project_slug) do
+    prefix = "symphony-local-webhook-secret"
+
+    stable_parts = [
+      resolve_text(tracker_api_key),
+      resolve_text(github_webhook_repo),
+      resolve_text(tracker_project_slug)
+    ]
+
+    if Enum.any?(stable_parts, &(&1 not in [nil, ""])) do
+      [prefix | stable_parts]
+      |> Enum.map(&(&1 || ""))
+      |> Enum.join(":")
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.url_encode64(padding: false)
+    else
+      random_webhook_secret()
+    end
   end
 end

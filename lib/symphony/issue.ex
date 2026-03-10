@@ -15,11 +15,13 @@ defmodule Symphony.Issue do
     :labels,
     :blocked_by,
     :created_at,
-    :updated_at
+    :updated_at,
+    feedback_assets: [],
+    feedback_assets_text: ""
   ]
 
-  def from_payload(payload) when is_map(payload) do
-    comments = extract_comments(payload)
+  def from_payload(payload, opts \\ []) when is_map(payload) do
+    comments = extract_comments(payload, opts)
 
     %__MODULE__{
       id: payload["id"],
@@ -34,7 +36,8 @@ defmodule Symphony.Issue do
       url: payload["url"],
       labels: extract_labels(payload),
       blocked_by: extract_blockers(payload),
-      created_at: parse_time(payload["createdAt"] || payload[:createdAt] || payload["created_at"]),
+      created_at:
+        parse_time(payload["createdAt"] || payload[:createdAt] || payload["created_at"]),
       updated_at: parse_time(payload["updatedAt"] || payload[:updatedAt] || payload["updated_at"])
     }
   end
@@ -109,28 +112,35 @@ defmodule Symphony.Issue do
     end)
   end
 
-  defp extract_comments(payload) do
+  defp extract_comments(payload, opts) do
+    include_managed_comments? = Keyword.get(opts, :include_managed_comments, false)
+
     payload
     |> get_in_flexible(["comments", "nodes"], [[:comments, :nodes]])
-    |> Enum.map(fn node ->
-      %{
-        id: node["id"] || node[:id],
-        body: normalize_comment_body(node["body"] || node[:body]),
-        user_name:
-          get_in(node, ["user", "name"]) || get_in(node, [:user, :name]) ||
-            node["userName"] || node[:userName],
-        created_at:
-          parse_time(node["createdAt"] || node[:createdAt] || node["created_at"]),
-        updated_at:
-          parse_time(node["updatedAt"] || node[:updatedAt] || node["updated_at"])
-      }
+    |> Enum.map(&comment_from_payload/1)
+    |> Enum.filter(fn comment ->
+      comment.body != "" and
+        (include_managed_comments? or not symphony_managed_comment?(comment.body))
     end)
-    |> Enum.filter(fn comment -> comment.body != "" end)
     |> Enum.sort_by(
-      fn comment -> if comment.created_at, do: DateTime.to_unix(comment.created_at, :microsecond), else: 0 end,
+      fn comment ->
+        if comment.created_at, do: DateTime.to_unix(comment.created_at, :microsecond), else: 0
+      end,
       :desc
     )
     |> Enum.take(8)
+  end
+
+  defp comment_from_payload(node) do
+    %{
+      id: node["id"] || node[:id],
+      body: normalize_comment_body(node["body"] || node[:body]),
+      user_name:
+        get_in(node, ["user", "name"]) || get_in(node, [:user, :name]) ||
+          node["userName"] || node[:userName],
+      created_at: parse_time(node["createdAt"] || node[:createdAt] || node["created_at"]),
+      updated_at: parse_time(node["updatedAt"] || node[:updatedAt] || node["updated_at"])
+    }
   end
 
   defp format_comments_text([]), do: ""
@@ -140,7 +150,10 @@ defmodule Symphony.Issue do
     |> Enum.reverse()
     |> Enum.map(fn comment ->
       author = comment.user_name || "Unknown"
-      timestamp = if comment.created_at, do: DateTime.to_iso8601(comment.created_at), else: "unknown-time"
+
+      timestamp =
+        if comment.created_at, do: DateTime.to_iso8601(comment.created_at), else: "unknown-time"
+
       "- [#{timestamp}] #{author}: #{comment.body}"
     end)
     |> Enum.join("\n")
@@ -155,6 +168,21 @@ defmodule Symphony.Issue do
   end
 
   defp normalize_comment_body(_), do: ""
+
+  def symphony_managed_comment?(body) when is_binary(body) do
+    String.contains?(body, "[Symphony:plan]") or
+      String.contains?(body, "[Symphony:review]") or
+      String.contains?(body, "[Symphony:recording]") or
+      String.contains?(body, "<!-- symphony-clarification -->") or
+      String.contains?(body, "<!-- symphony-review -->") or
+      String.contains?(body, "<!-- symphony-recording -->") or
+      String.contains?(body, "_Maintained by Symphony._") or
+      String.contains?(body, "<!-- symphony-workpad -->") or
+      String.contains?(body, "_Symphony review handoff._") or
+      String.contains?(body, "_Symphony recording artifact._")
+  end
+
+  def symphony_managed_comment?(_), do: false
 
   defp get_in_flexible(payload, string_path, atom_paths) do
     value =
