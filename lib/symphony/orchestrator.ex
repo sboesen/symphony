@@ -4,17 +4,25 @@ defmodule Symphony.Orchestrator do
   use GenServer
   require Logger
 
-  alias Symphony.{Workflow, Config, Tracker, WorkspaceManager, Issue}
+  alias Symphony.{Workflow, Config, Tracker, WorkspaceManager, Issue, GitReview, PlanContract}
+
+  @heartbeat_interval_ms 5_000
+  @handoff_pending_ttl_ms 30_000
 
   defstruct [
     :workflow_path,
     :workflow_mtime_ms,
     :config,
+    :status_port,
     :prompt_template,
+    :poll_enabled,
     :poll_interval_ms,
     paused: false,
+    paused_reason: nil,
+    paused_until_ms: nil,
     running: %{},
     claimed: MapSet.new(),
+    handoff_pending: %{},
     retry_attempts: %{},
     completed: MapSet.new(),
     recent_runs: [],
@@ -38,6 +46,12 @@ defmodule Symphony.Orchestrator do
 
   def current_config do
     GenServer.call(__MODULE__, :current_config)
+  end
+
+  def merge_review_handoff(issue_identifier, opts \\ [])
+
+  def merge_review_handoff(issue_identifier, opts) when is_binary(issue_identifier) and is_list(opts) do
+    GenServer.call(__MODULE__, {:merge_review_handoff, issue_identifier, opts}, 30_000)
   end
 
   def external_event(type, issue_identifier, details \\ %{}) do
@@ -69,19 +83,32 @@ defmodule Symphony.Orchestrator do
 
     with {:ok, workflow} <- Workflow.load(workflow_path),
          {:ok, config} <- Config.from_workflow(workflow),
-         :ok <- Config.validate_dispatch(config) do
+         :ok <- Config.validate_dispatch(config),
+         {:ok, status_port} <- Symphony.StatusServer.ensure_started(config.server_port) do
       state = %__MODULE__{
         workflow_path: workflow_path,
         workflow_mtime_ms: workflow.mtime_ms,
         config: config,
+        status_port: status_port,
         prompt_template: workflow.prompt_template,
+        poll_enabled: config.poll_enabled,
         poll_interval_ms: config.poll_interval_ms
       }
 
-      _ = Symphony.StatusServer.ensure_started(config.server_port)
-      state = log_event(state, "system_ready", nil, %{server_port: config.server_port})
+      state =
+        log_event(state, "system_ready", nil, %{
+          configured_server_port: config.server_port,
+          status_port: status_port
+        })
       cleanup_startup_terminals(state)
-      schedule_tick(0)
+      state =
+        state
+        |> reconcile_running()
+        |> reconcile_review_handoffs()
+        |> maybe_resume_from_rate_limit_pause()
+        |> dispatch_cycle()
+      schedule_heartbeat(0)
+      schedule_reconcile(0, config.poll_enabled)
       {:ok, state}
     else
       {:error, reason} ->
@@ -98,7 +125,12 @@ defmodule Symphony.Orchestrator do
   end
 
   def handle_call(:current_config, _from, state) do
-    {:reply, state.config, state}
+    {:reply, current_config_with_status_port(state), state}
+  end
+
+  def handle_call({:merge_review_handoff, issue_identifier, opts}, _from, state) do
+    {reply, state} = merge_review_handoff_now(state, issue_identifier, opts)
+    {:reply, reply, state}
   end
 
   def handle_call({:external_event, type, issue_identifier, details}, _from, state) do
@@ -110,19 +142,22 @@ defmodule Symphony.Orchestrator do
     state =
       state
       |> log_event("manual_refresh_requested", nil, %{})
+      |> reconcile_running()
+      |> reconcile_review_handoffs()
+      |> maybe_resume_from_rate_limit_pause()
       |> dispatch_cycle()
 
     {:reply, {:ok, status_payload(state)}, state}
   end
 
   def handle_call(:pause, _from, state) do
-    state = %{state | paused: true}
-    state = log_event(state, "scheduler_paused", nil, %{})
+    state = %{state | paused: true, paused_reason: "manual", paused_until_ms: nil}
+    state = log_event(state, "scheduler_paused", nil, %{reason: "manual"})
     {:reply, {:ok, %{paused: true}}, state}
   end
 
   def handle_call(:resume, _from, state) do
-    state = %{state | paused: false}
+    state = %{state | paused: false, paused_reason: nil, paused_until_ms: nil}
     state = log_event(state, "scheduler_resumed", nil, %{})
     {:reply, {:ok, %{paused: false}}, state}
   end
@@ -162,10 +197,20 @@ defmodule Symphony.Orchestrator do
     end
   end
 
-  def handle_info(:tick, state) do
+  def handle_info(:heartbeat, state) do
+    state = maybe_reload_workflow(state)
+    state = reconcile_stalled_runs(state)
+    state = maybe_resume_from_rate_limit_pause(state)
+
+    schedule_heartbeat(@heartbeat_interval_ms)
+    {:noreply, state}
+  end
+
+  def handle_info(:reconcile, state) do
     state = maybe_reload_workflow(state)
     state = reconcile_running(state)
-    state = reconcile_stalled_runs(state)
+    state = reconcile_review_handoffs(state)
+    state = maybe_resume_from_rate_limit_pause(state)
 
     state =
       case Config.validate_dispatch(state.config) do
@@ -182,7 +227,7 @@ defmodule Symphony.Orchestrator do
           log_event(state, "dispatch_blocked", nil, %{reason: inspect(reason)})
       end
 
-    schedule_tick(state.poll_interval_ms)
+    schedule_reconcile(state.poll_interval_ms, state.poll_enabled)
     {:noreply, state}
   end
 
@@ -199,6 +244,11 @@ defmodule Symphony.Orchestrator do
           %{
             state
             | completed: MapSet.put(state.completed, issue_id),
+	              handoff_pending:
+	                if(state.config.review_required,
+	                  do: Map.put(state.handoff_pending, issue_id, System.monotonic_time(:millisecond)),
+	                  else: state.handoff_pending
+	                ),
               recent_runs: prepend_recent_run(state.recent_runs, recent_run)
           }
           |> log_event("run_finished", entry.issue_identifier, %{
@@ -210,23 +260,54 @@ defmodule Symphony.Orchestrator do
         state =
           case result do
             {:ok, _payload} ->
-              case Tracker.mark_in_review(state.config, issue_id) do
-                :ok ->
-                  log_event(state, "tracker_marked_in_review", entry.issue_identifier, %{
-                    issue_id: issue_id
-                  })
+              if state.config.review_required do
+                case Tracker.mark_in_review(state.config, issue_id) do
+                  :ok ->
+                    log_event(state, "tracker_marked_in_review", entry.issue_identifier, %{
+                      issue_id: issue_id
+                    })
 
-                {:error, reason} ->
-                  Logger.warning(
-                    "failed to mark issue #{entry.issue_identifier} in review: #{inspect(reason)}"
-                  )
+                  {:error, {:rate_limited, reset_ms}} ->
+                    state
+                    |> pause_for_rate_limit(reset_ms, "mark_in_review")
+                    |> schedule_retry(issue_id, entry.issue_identifier, 1, "tracker_rate_limited")
 
-                  state
-                  |> log_event("tracker_mark_in_review_failed", entry.issue_identifier, %{
-                    issue_id: issue_id,
-                    reason: inspect(reason)
-                  })
-                  |> schedule_retry(issue_id, entry.issue_identifier, 1, "normal_completion")
+                  {:error, reason} ->
+                    Logger.warning(
+                      "failed to mark issue #{entry.issue_identifier} in review: #{inspect(reason)}"
+                    )
+
+                    state
+                    |> log_event("tracker_mark_in_review_failed", entry.issue_identifier, %{
+                      issue_id: issue_id,
+                      reason: inspect(reason)
+                    })
+                    |> schedule_retry(issue_id, entry.issue_identifier, 1, "normal_completion")
+                end
+              else
+                case Tracker.mark_done(state.config, issue_id) do
+                  :ok ->
+                    log_event(state, "tracker_marked_done", entry.issue_identifier, %{
+                      issue_id: issue_id
+                    })
+
+                  {:error, {:rate_limited, reset_ms}} ->
+                    state
+                    |> pause_for_rate_limit(reset_ms, "mark_done")
+                    |> schedule_retry(issue_id, entry.issue_identifier, 1, "tracker_rate_limited")
+
+                  {:error, reason} ->
+                    Logger.warning(
+                      "failed to mark issue #{entry.issue_identifier} done: #{inspect(reason)}"
+                    )
+
+                    state
+                    |> log_event("tracker_mark_done_failed", entry.issue_identifier, %{
+                      issue_id: issue_id,
+                      reason: inspect(reason)
+                    })
+                    |> schedule_retry(issue_id, entry.issue_identifier, 1, "normal_completion")
+                end
               end
 
             {:error, payload} ->
@@ -237,13 +318,40 @@ defmodule Symphony.Orchestrator do
                 "agent run failed for issue #{entry.issue_identifier} (attempt=#{attempt}): #{inspect(reason)}"
               )
 
-              state
-              |> log_event("run_failed", entry.issue_identifier, %{
-                issue_id: issue_id,
-                attempt: attempt,
-                reason: inspect(reason)
-              })
-              |> schedule_retry(issue_id, entry.issue_identifier, attempt + 1, inspect(reason))
+              next_state =
+                state
+                |> log_event("run_failed", entry.issue_identifier, %{
+                  issue_id: issue_id,
+                  attempt: attempt,
+                  reason: inspect(reason)
+                })
+
+              cond do
+                clarification_requested?(reason) ->
+                  next_state
+                  |> log_event("clarification_requested", entry.issue_identifier, %{
+                    issue_id: issue_id,
+                    attempt: attempt,
+                    reason: inspect(reason)
+                  })
+
+                non_retryable_failure?(reason) ->
+                  next_state
+                  |> log_event("run_failed_non_retryable", entry.issue_identifier, %{
+                    issue_id: issue_id,
+                    attempt: attempt,
+                    reason: inspect(reason)
+                  })
+
+                reset_ms = rate_limit_reset_ms(reason) ->
+                  next_state
+                  |> pause_for_rate_limit(reset_ms, "agent_run_failed")
+                  |> schedule_retry(issue_id, entry.issue_identifier, attempt + 1, "tracker_rate_limited")
+
+                true ->
+                  next_state
+                  |> schedule_retry(issue_id, entry.issue_identifier, attempt + 1, inspect(reason))
+              end
           end
 
         {:noreply, state}
@@ -324,10 +432,11 @@ defmodule Symphony.Orchestrator do
         {:noreply, state}
 
       entry ->
-        updated_entry =
+        {updated_entry, details} =
           entry
           |> Map.put(:last_codex_timestamp, System.monotonic_time(:millisecond))
           |> Map.put(:last_update_type, to_string(type))
+          |> apply_phase_event(to_string(type), details)
 
         state =
           state
@@ -407,13 +516,26 @@ defmodule Symphony.Orchestrator do
         end
 
       {:error, reason} ->
-        schedule_retry(
-          state,
-          retry_entry.issue_id,
-          retry_entry.identifier,
-          retry_entry.attempt + 1,
-          inspect(reason)
-        )
+        case rate_limit_reset_ms(reason) do
+          nil ->
+            schedule_retry(
+              state,
+              retry_entry.issue_id,
+              retry_entry.identifier,
+              retry_entry.attempt + 1,
+              inspect(reason)
+            )
+
+          reset_ms ->
+            state
+            |> pause_for_rate_limit(reset_ms, "retry_fetch_candidates")
+            |> schedule_retry(
+              retry_entry.issue_id,
+              retry_entry.identifier,
+              retry_entry.attempt + 1,
+              "tracker_rate_limited"
+            )
+        end
     end
   end
 
@@ -442,17 +564,23 @@ defmodule Symphony.Orchestrator do
     with {:ok, workflow} <- Workflow.load(state.workflow_path) do
       if workflow.mtime_ms != state.workflow_mtime_ms do
         with {:ok, config} <- Config.from_workflow(workflow),
-             :ok <- Config.validate_dispatch(config) do
-          _ = Symphony.StatusServer.ensure_started(config.server_port)
+             :ok <- Config.validate_dispatch(config),
+             {:ok, status_port} <- Symphony.StatusServer.ensure_started(config.server_port) do
 
           %{
             state
             | workflow_mtime_ms: workflow.mtime_ms,
               config: config,
+              status_port: status_port,
               prompt_template: workflow.prompt_template,
+              poll_enabled: config.poll_enabled,
               poll_interval_ms: config.poll_interval_ms
           }
-          |> log_event("workflow_reloaded", nil, %{workflow_path: state.workflow_path})
+          |> log_event("workflow_reloaded", nil, %{
+            workflow_path: state.workflow_path,
+            configured_server_port: config.server_port,
+            status_port: status_port
+          })
         else
           _ -> state
         end
@@ -489,6 +617,9 @@ defmodule Symphony.Orchestrator do
               MapSet.member?(acc.claimed, issue.id) ->
                 acc
 
+              handoff_pending?(acc, issue.id) ->
+                acc
+
               not can_dispatch_now?(acc, issue) ->
                 acc
 
@@ -504,7 +635,14 @@ defmodule Symphony.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("tracker fetch_candidates failed: #{inspect(reason)}")
-        log_event(state, "candidate_poll_failed", nil, %{reason: inspect(reason)})
+
+        state =
+          log_event(state, "candidate_poll_failed", nil, %{reason: inspect(reason)})
+
+        case rate_limit_reset_ms(reason) do
+          nil -> state
+          reset_ms -> pause_for_rate_limit(state, reset_ms, "fetch_candidates")
+        end
     end
   end
 
@@ -566,41 +704,63 @@ defmodule Symphony.Orchestrator do
   defp dispatch_issue(state, issue, attempt) do
     orchestrator_pid = self()
     dispatch_attempt = if is_integer(attempt) and attempt > 0, do: attempt, else: 1
+    path = workspace_path(issue.identifier, state.config.workspace_root)
 
     task_fn = fn ->
       Symphony.AgentRunner.run(
         issue,
-        attempt,
+        dispatch_attempt,
         state.config,
         state.prompt_template,
         orchestrator_pid
       )
     end
 
-    case Task.Supervisor.start_child(Symphony.TaskSupervisor, task_fn) do
-      {:ok, pid} ->
-        state =
-          log_event(state, "issue_dispatched", issue.identifier, %{
+    state =
+      log_event(state, "issue_dispatched", issue.identifier, %{
+        issue_id: issue.id,
+        attempt: dispatch_attempt
+      })
+
+    state =
+      log_event(state, "tracker_mark_started_started", issue.identifier, %{
+        issue_id: issue.id
+      })
+
+    mark_started_started_at = System.monotonic_time(:millisecond)
+
+    state =
+      case Tracker.mark_started(state.config, issue.id) do
+        :ok ->
+          log_event(state, "tracker_marked_started", issue.identifier, %{
             issue_id: issue.id,
-            attempt: dispatch_attempt
+            elapsed_ms: System.monotonic_time(:millisecond) - mark_started_started_at
           })
 
-        state =
-          case Tracker.mark_started(state.config, issue.id) do
-            :ok ->
-              log_event(state, "tracker_marked_started", issue.identifier, %{issue_id: issue.id})
+        {:error, {:rate_limited, reset_ms}} ->
+          state
+          |> log_event("tracker_mark_started_failed", issue.identifier, %{
+            issue_id: issue.id,
+            reason: ":rate_limited",
+            elapsed_ms: System.monotonic_time(:millisecond) - mark_started_started_at
+          })
+          |> pause_for_rate_limit(reset_ms, "mark_started")
 
-            {:error, reason} ->
-              Logger.warning("failed to mark issue #{issue.identifier} started: #{inspect(reason)}")
+        {:error, reason} ->
+          Logger.warning("failed to mark issue #{issue.identifier} started: #{inspect(reason)}")
 
-              log_event(state, "tracker_mark_started_failed", issue.identifier, %{
-                issue_id: issue.id,
-                reason: inspect(reason)
-              })
-          end
+          log_event(state, "tracker_mark_started_failed", issue.identifier, %{
+            issue_id: issue.id,
+            reason: inspect(reason),
+            elapsed_ms: System.monotonic_time(:millisecond) - mark_started_started_at
+          })
+      end
 
+    state = maybe_sync_placeholder_workpad(state, issue, path)
+
+    case Task.Supervisor.start_child(Symphony.TaskSupervisor, task_fn) do
+      {:ok, pid} ->
         monitor = Process.monitor(pid)
-        path = workspace_path(issue.identifier, state.config.workspace_root)
 
         running_entry = %{
           pid: pid,
@@ -617,6 +777,8 @@ defmodule Symphony.Orchestrator do
           thread_id: nil,
           turn_id: nil,
           last_update_type: nil,
+          phase: "dispatched",
+          phase_started_at_ms: System.monotonic_time(:millisecond),
           codex_input_tokens: 0,
           codex_output_tokens: 0,
           codex_total_tokens: 0
@@ -758,6 +920,213 @@ defmodule Symphony.Orchestrator do
     end
   end
 
+  defp reconcile_review_handoffs(state) do
+    pending =
+      state.recent_runs
+      |> Enum.reduce(%{}, fn run, acc ->
+        case pending_review_artifact(run) do
+          nil -> acc
+          artifact -> Map.put_new(acc, run.issue_id, %{run: run, artifact: artifact})
+        end
+      end)
+
+    issue_ids = Map.keys(pending)
+
+    if issue_ids == [] do
+      state
+    else
+      case Tracker.fetch_states_by_ids(state.config, issue_ids) do
+        {:ok, issues} ->
+          issue_map = Map.new(issues, &{&1.id, &1})
+
+          Enum.reduce(pending, state, fn {issue_id, %{run: run, artifact: artifact}}, acc ->
+            case Map.get(issue_map, issue_id) do
+              nil ->
+                acc
+
+              issue ->
+                acc
+                |> maybe_clear_handoff_pending(issue)
+                |> maybe_handle_review_transition(run, artifact, issue)
+            end
+          end)
+
+        {:error, _} ->
+          state
+      end
+    end
+  end
+
+  defp merge_review_handoff_now(state, issue_identifier, opts) do
+    force_done? = Keyword.get(opts, :force_done, false)
+
+    case Tracker.fetch_issue_by_identifier(state.config, issue_identifier) do
+      {:ok, %Issue{} = issue} ->
+        if force_done? or Issue.normalize_state(issue.state) == "done" do
+          case retry_merge_review_handoff(state, issue_identifier, issue) do
+            {:ok, next_state} ->
+              {{:ok, :merged_or_attempted}, next_state}
+
+            {:error, reason, next_state} ->
+              next_state =
+                log_event(next_state, "review_merge_handoff_failed", issue.identifier, %{
+                  issue_id: issue.id,
+                  reason: inspect(reason),
+                  force_done: force_done?
+                })
+
+              {{:error, reason}, next_state}
+          end
+        else
+          {{:error, :issue_not_done}, state}
+        end
+
+      {:ok, nil} ->
+        {{:error, :issue_not_found}, state}
+
+      {:error, reason} ->
+        {{:error, reason}, state}
+    end
+  end
+
+  defp pending_review_artifact_for_issue(state, issue_id) do
+    state.recent_runs
+    |> Enum.find_value(fn run ->
+      if run.issue_id == issue_id, do: pending_review_artifact(run), else: nil
+    end)
+  end
+
+  defp lookup_review_artifact_for_issue(state, issue_identifier) do
+    repo_slug =
+      state.config.github_webhook_repo ||
+        github_repo_slug_from_config(state.config)
+
+    with repo_slug when is_binary(repo_slug) <- repo_slug,
+         {:ok, artifact} <- GitReview.find_open_review_pr(repo_slug, issue_identifier) do
+      artifact
+      |> Map.put(:workspace_path, state.config.workspace_root || File.cwd!())
+    else
+      _ -> nil
+    end
+  end
+
+  defp maybe_handle_review_transition(state, run, artifact, issue) do
+    case Issue.normalize_state(issue.state) do
+      "done" ->
+        case do_merge_review_pr_for_done(state, run, artifact, issue) do
+          {:ok, next_state} -> next_state
+          {:error, _reason, next_state} -> next_state
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp maybe_clear_handoff_pending(state, issue) do
+    normalized = Issue.normalize_state(issue.state)
+
+    cond do
+      not Map.has_key?(state.handoff_pending, issue.id) ->
+        state
+
+      normalized in ["in review", "review"] ->
+        state
+
+      normalized not in state.config.tracker_active_states ->
+        %{state | handoff_pending: Map.delete(state.handoff_pending, issue.id)}
+
+      not handoff_pending?(state, issue.id) ->
+        %{state | handoff_pending: Map.delete(state.handoff_pending, issue.id)}
+
+      true ->
+        state
+    end
+  end
+
+  defp handoff_pending?(state, issue_id) do
+    case Map.get(state.handoff_pending, issue_id) do
+      started_at when is_integer(started_at) ->
+        System.monotonic_time(:millisecond) - started_at < @handoff_pending_ttl_ms
+
+      _ ->
+        false
+    end
+  end
+
+  defp merge_review_pr_for_done(state, run, artifact, issue) do
+    case do_merge_review_pr_for_done(state, run, artifact, issue) do
+      {:ok, next_state} -> next_state
+      {:error, _reason, next_state} -> next_state
+    end
+  end
+
+  defp do_merge_review_pr_for_done(state, run, artifact, issue) do
+    case GitReview.merge_review_pr(run.workspace_path, artifact) do
+      {:ok, merged_artifact} ->
+        state =
+          state
+          |> update_recent_run_artifact(issue.id, merged_artifact)
+          |> log_event("review_pr_merged_from_done", issue.identifier, %{
+            issue_id: issue.id,
+            pr_number: merged_artifact[:pr_number] || merged_artifact["pr_number"],
+            pr_url: merged_artifact[:pr_url] || merged_artifact["pr_url"]
+          })
+
+        case Tracker.publish_review_handoff(state.config, issue, merged_artifact) do
+          {:ok, republished_artifact} ->
+            {:ok, update_recent_run_artifact(state, issue.id, republished_artifact)}
+
+          _ ->
+            {:ok, state}
+        end
+
+      {:error, reason} ->
+        next_state =
+          log_event(state, "review_pr_merge_failed_from_done", issue.identifier, %{
+            issue_id: issue.id,
+            reason: inspect(reason),
+            pr_number: artifact[:pr_number] || artifact["pr_number"],
+            pr_url: artifact[:pr_url] || artifact["pr_url"]
+          })
+
+        {:error, reason, next_state}
+    end
+  end
+
+  defp retry_merge_review_handoff(state, issue_identifier, issue, attempts \\ 8)
+
+  defp retry_merge_review_handoff(state, issue_identifier, issue, attempts) when attempts > 0 do
+    artifact =
+      pending_review_artifact_for_issue(state, issue.id) ||
+        lookup_review_artifact_for_issue(state, issue_identifier)
+
+    case artifact do
+      nil ->
+        Process.sleep(250)
+        retry_merge_review_handoff(state, issue_identifier, issue, attempts - 1)
+
+      artifact ->
+        case do_merge_review_pr_for_done(
+               state,
+               %{workspace_path: artifact[:workspace_path] || artifact["workspace_path"]},
+               artifact,
+               issue
+             ) do
+          {:ok, next_state} ->
+            {:ok, next_state}
+
+          {:error, _reason, next_state} ->
+            Process.sleep(250)
+            retry_merge_review_handoff(next_state, issue_identifier, issue, attempts - 1)
+        end
+    end
+  end
+
+  defp retry_merge_review_handoff(state, _issue_identifier, _issue, 0) do
+    {:error, :review_pr_not_found, state}
+  end
+
   defp stall_timeout_for_entry(entry, base_timeout) do
     type = to_string(entry.last_update_type || "")
 
@@ -861,16 +1230,86 @@ defmodule Symphony.Orchestrator do
     }
   end
 
-  defp schedule_tick(interval_ms) do
-    Process.send_after(self(), :tick, interval_ms)
+  defp schedule_heartbeat(interval_ms) do
+    Process.send_after(self(), :heartbeat, interval_ms)
   end
+
+  defp schedule_reconcile(_interval_ms, false), do: :ok
+
+  defp schedule_reconcile(interval_ms, true) do
+    Process.send_after(self(), :reconcile, interval_ms)
+  end
+
+  defp maybe_sync_placeholder_workpad(state, issue, workspace_path) do
+    body = PlanContract.render_planning_placeholder(issue.title)
+    state =
+      log_event(state, "workpad_placeholder_started", issue.identifier, %{
+        issue_id: issue.id
+      })
+    started_at = System.monotonic_time(:millisecond)
+    preferred_comment_id = read_workpad_comment_id(workspace_path)
+
+    case Tracker.upsert_workpad(state.config, issue, body, preferred_comment_id) do
+      {:ok, workpad} ->
+        persist_workpad_comment_id(workspace_path, workpad[:comment_id])
+
+        log_event(state, "workpad_placeholder_synced", issue.identifier, %{
+          issue_id: issue.id,
+          comment_id: workpad[:comment_id],
+          action: workpad[:action],
+          elapsed_ms: System.monotonic_time(:millisecond) - started_at
+        })
+
+      {:error, :rate_limited} ->
+        log_event(state, "workpad_placeholder_deferred", issue.identifier, %{
+          issue_id: issue.id,
+          reason: ":rate_limited",
+          elapsed_ms: System.monotonic_time(:millisecond) - started_at
+        })
+
+      {:error, reason} ->
+        log_event(state, "workpad_placeholder_failed", issue.identifier, %{
+          issue_id: issue.id,
+          reason: inspect(reason),
+          elapsed_ms: System.monotonic_time(:millisecond) - started_at
+        })
+    end
+  end
+
+  defp read_workpad_comment_id(workspace_path) when is_binary(workspace_path) do
+    path = Path.join(workspace_path, ".git/symphony/workpad-comment-id")
+
+    case File.read(path) do
+      {:ok, raw} ->
+        case String.trim(raw) do
+          "" -> nil
+          value -> value
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp persist_workpad_comment_id(workspace_path, comment_id)
+       when is_binary(workspace_path) and is_binary(comment_id) and comment_id != "" do
+    path = Path.join(workspace_path, ".git/symphony/workpad-comment-id")
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, comment_id <> "\n")
+    :ok
+  end
+
+  defp persist_workpad_comment_id(_, _), do: :ok
 
   defp status_payload(state) do
     %{
       workflow_path: state.workflow_path,
+      poll_enabled: state.poll_enabled,
       workflow_mtime_ms: state.workflow_mtime_ms,
       poll_interval_ms: state.poll_interval_ms,
       paused: state.paused,
+      paused_reason: state.paused_reason,
+      paused_until_ms: state.paused_until_ms,
       running_count: map_size(state.running),
       running: summarize_running(state.running),
       retry_count: map_size(state.retry_attempts),
@@ -882,9 +1321,40 @@ defmodule Symphony.Orchestrator do
       recent_runs: summarize_recent_runs(state.recent_runs),
       events: summarize_events(state.events),
       codex_totals: state.codex_totals,
+      status_port: state.status_port,
       config: summarize_config(state.config)
     }
   end
+
+  defp maybe_resume_from_rate_limit_pause(%{paused: true, paused_reason: "linear_rate_limit"} = state) do
+    if is_integer(state.paused_until_ms) and System.system_time(:millisecond) >= state.paused_until_ms do
+      state
+      |> Map.put(:paused, false)
+      |> Map.put(:paused_reason, nil)
+      |> Map.put(:paused_until_ms, nil)
+      |> log_event("scheduler_resumed", nil, %{reason: "linear_rate_limit_reset"})
+    else
+      state
+    end
+  end
+
+  defp maybe_resume_from_rate_limit_pause(state), do: state
+
+  defp pause_for_rate_limit(state, reset_ms, context) do
+    state
+    |> Map.put(:paused, true)
+    |> Map.put(:paused_reason, "linear_rate_limit")
+    |> Map.put(:paused_until_ms, reset_ms)
+    |> log_event("scheduler_paused", nil, %{
+      reason: "linear_rate_limit",
+      context: context,
+      reset_ms: reset_ms
+    })
+  end
+
+  defp rate_limit_reset_ms({:rate_limited, reset_ms}) when is_integer(reset_ms), do: reset_ms
+  defp rate_limit_reset_ms({:error, {:rate_limited, reset_ms}}) when is_integer(reset_ms), do: reset_ms
+  defp rate_limit_reset_ms(_), do: nil
 
   defp issue_status_payload(state, issue_identifier) do
     issue_identifier = String.trim(issue_identifier)
@@ -1000,9 +1470,23 @@ defmodule Symphony.Orchestrator do
     }
   end
 
+  defp pending_review_artifact(run) when is_map(run) do
+    run.artifacts
+    |> List.wrap()
+    |> Enum.find(fn artifact ->
+      kind = artifact[:kind] || artifact["kind"]
+      pr_merged = artifact[:pr_merged] || artifact["pr_merged"]
+      kind == "pull_request" and pr_merged != true
+    end)
+  end
+
+  defp pending_review_artifact(_), do: nil
+
   defp summarize_config(config) do
     %{
       tracker_kind: config.tracker_kind,
+      tracker_project_slug: config.tracker_project_slug,
+      poll_enabled: config.poll_enabled,
       poll_interval_ms: config.poll_interval_ms,
       max_concurrent_agents: config.max_concurrent_agents,
       workspace_root: config.workspace_root,
@@ -1021,13 +1505,23 @@ defmodule Symphony.Orchestrator do
       recording_publish_to_tracker: config.recording_publish_to_tracker,
       recording_publish_comment: config.recording_publish_comment,
       review_pr_enabled: config.review_pr_enabled,
+      review_required: config.review_required,
       review_pr_draft: config.review_pr_draft,
       review_pr_base_branch: config.review_pr_base_branch,
       review_pr_auto_merge: config.review_pr_auto_merge,
       github_webhook_auto_register: config.github_webhook_auto_register,
       github_webhook_provider: config.github_webhook_provider,
-      github_webhook_repo: config.github_webhook_repo
+      github_webhook_repo: config.github_webhook_repo,
+      linear_webhook_auto_register: config.linear_webhook_auto_register
     }
+  end
+
+  defp current_config_with_status_port(state) do
+    if is_integer(state.status_port) and state.status_port > 0 do
+      %{state.config | server_port: state.status_port}
+    else
+      state.config
+    end
   end
 
   defp summarize_profiles(profiles) do
@@ -1069,6 +1563,31 @@ defmodule Symphony.Orchestrator do
     |> Enum.take(20)
   end
 
+  defp update_recent_run_artifact(state, issue_id, updated_artifact) do
+    recent_runs =
+      Enum.map(state.recent_runs, fn run ->
+        if run.issue_id == issue_id do
+          artifacts =
+            Enum.map(List.wrap(run.artifacts), fn artifact ->
+              if same_review_artifact?(artifact, updated_artifact), do: updated_artifact, else: artifact
+            end)
+
+          %{run | artifacts: artifacts}
+        else
+          run
+        end
+      end)
+
+    %{state | recent_runs: recent_runs}
+  end
+
+  defp same_review_artifact?(left, right) do
+    (left[:kind] || left["kind"]) == "pull_request" and
+      (right[:kind] || right["kind"]) == "pull_request" and
+      (left[:pr_number] || left["pr_number"]) == (right[:pr_number] || right["pr_number"]) and
+      (left[:repo_slug] || left["repo_slug"]) == (right[:repo_slug] || right["repo_slug"])
+  end
+
   defp result_outcome({:ok, _}), do: "completed"
   defp result_outcome({:error, _}), do: "failed"
   defp result_outcome(_), do: "unknown"
@@ -1096,6 +1615,60 @@ defmodule Symphony.Orchestrator do
     |> Map.put(:thread_id, payload[:thread_id] || entry.thread_id)
     |> Map.put(:turn_id, payload[:turn_id] || entry.turn_id)
     |> Map.put(:last_update_type, update_type)
+  end
+
+  defp apply_phase_event(entry, type, details) do
+    now = System.monotonic_time(:millisecond)
+
+    case type do
+      "workspace_setup_started" ->
+        {Map.put(entry, :phase, "workspace_setup") |> Map.put(:phase_started_at_ms, now), details}
+
+      "workspace_setup_finished" ->
+        details = maybe_put_phase_elapsed(details, entry)
+        {Map.put(entry, :phase, "planning") |> Map.put(:phase_started_at_ms, now), details}
+
+      "workspace_setup_failed" ->
+        {entry, maybe_put_phase_elapsed(details, entry)}
+
+      "planning_turn_started" ->
+        {Map.put(entry, :phase, "planning") |> Map.put(:phase_started_at_ms, now), details}
+
+      "planning_turn_finished" ->
+        details = maybe_put_phase_elapsed(details, entry)
+        {Map.put(entry, :phase, "execution") |> Map.put(:phase_started_at_ms, now), details}
+
+      "planning_turn_failed" ->
+        {entry, maybe_put_phase_elapsed(details, entry)}
+
+      "demo_capture_started" ->
+        {Map.put(entry, :phase, "demo") |> Map.put(:phase_started_at_ms, now), details}
+
+      "demo_capture_succeeded" ->
+        details = maybe_put_phase_elapsed(details, entry)
+        {Map.put(entry, :phase, "review_handoff") |> Map.put(:phase_started_at_ms, now), details}
+
+      "demo_capture_skipped" ->
+        details = maybe_put_phase_elapsed(details, entry)
+        {Map.put(entry, :phase, "review_handoff") |> Map.put(:phase_started_at_ms, now), details}
+
+      "demo_capture_failed" ->
+        {entry, maybe_put_phase_elapsed(details, entry)}
+
+      "workpad_synced" ->
+        {entry, Map.put_new(details, "phase", entry.phase)}
+
+      _ ->
+        {entry, details}
+    end
+  end
+
+  defp maybe_put_phase_elapsed(details, entry) do
+    if is_integer(entry[:phase_started_at_ms]) do
+      Map.put_new(details, "elapsed_ms", System.monotonic_time(:millisecond) - entry.phase_started_at_ms)
+    else
+      details
+    end
   end
 
   defp summarize_routing(nil), do: nil
@@ -1128,7 +1701,10 @@ defmodule Symphony.Orchestrator do
   defp summarize_issue(_), do: nil
 
   defp summarize_demo(artifacts) when is_list(artifacts) do
-    case Enum.find(artifacts, &(&1[:kind] == "video_recording" or &1["kind"] == "video_recording")) do
+    case Enum.find(artifacts, fn artifact ->
+           kind = artifact[:kind] || artifact["kind"]
+           kind in ["video_recording", "demo_artifact"]
+         end) do
       nil ->
         nil
 
@@ -1139,6 +1715,7 @@ defmodule Symphony.Orchestrator do
           Enum.filter(results, fn result -> (result[:passed] || result["passed"]) != true end)
 
         %{
+          capture_type: artifact[:capture_type] || artifact["capture_type"] || "video",
           status: artifact[:status] || artifact["status"],
           demo_plan_path: artifact[:demo_plan_path] || artifact["demo_plan_path"],
           non_demoable: artifact[:non_demoable] || artifact["non_demoable"] || false,
@@ -1199,7 +1776,146 @@ defmodule Symphony.Orchestrator do
       details: details
     }
 
+    maybe_log_runtime_event(event)
+
     %{state | events: [event | state.events] |> Enum.take(200)}
+  end
+
+  defp maybe_log_runtime_event(event) do
+    case format_runtime_event(event) do
+      nil -> :ok
+      line -> Logger.info(line)
+    end
+  end
+
+  defp format_runtime_event(%{type: type, issue_identifier: issue, details: details}) do
+    prefix =
+      case issue do
+        nil -> "[symphony]"
+        value -> "[#{value}]"
+      end
+
+    case type do
+      "issue_dispatched" ->
+        "#{prefix} dispatched (attempt #{details[:attempt] || details["attempt"] || 1})"
+
+      "tracker_marked_started" ->
+        "#{prefix} moved to In Progress#{format_elapsed(details)}"
+
+      "tracker_mark_started_started" ->
+        "#{prefix} marking In Progress"
+
+      "tracker_mark_started_failed" ->
+        "#{prefix} failed to mark In Progress#{format_elapsed(details)}: #{details[:reason] || details["reason"]}"
+
+      "workpad_placeholder_started" ->
+        "#{prefix} posting plan placeholder"
+
+      "workpad_placeholder_synced" ->
+        "#{prefix} plan placeholder posted#{format_elapsed(details)}"
+
+      "workpad_placeholder_deferred" ->
+        "#{prefix} plan placeholder deferred#{format_elapsed(details)}: #{details[:reason] || details["reason"]}"
+
+      "workpad_placeholder_failed" ->
+        "#{prefix} plan placeholder failed#{format_elapsed(details)}: #{details[:reason] || details["reason"]}"
+
+      "workspace_setup_started" ->
+        "#{prefix} workspace setup started"
+
+      "workspace_setup_finished" ->
+        "#{prefix} workspace setup finished#{format_elapsed(details)}"
+
+      "workspace_setup_failed" ->
+        "#{prefix} workspace setup failed: #{details[:reason] || details["reason"]}"
+
+      "planning_turn_started" ->
+        "#{prefix} planning started"
+
+      "planning_turn_finished" ->
+        "#{prefix} planning finished#{format_elapsed(details)}"
+
+      "planning_turn_failed" ->
+        "#{prefix} planning failed#{format_elapsed(details)}: #{details[:reason] || details["reason"]}"
+
+      "workpad_synced" ->
+        action = details[:action] || details["action"]
+        suffix = if action, do: " (#{action})", else: ""
+        "#{prefix} plan synced#{suffix}#{format_elapsed(details)}"
+
+      "issue_refresh_started" ->
+        "#{prefix} refreshing issue"
+
+      "issue_refresh_finished" ->
+        "#{prefix} issue refreshed#{format_elapsed(details)}"
+
+      "issue_refresh_failed" ->
+        "#{prefix} issue refresh failed#{format_elapsed(details)}: #{details[:reason] || details["reason"]}"
+
+      "execution_turn_started" ->
+        "#{prefix} execution started"
+
+      "execution_turn_finished" ->
+        "#{prefix} execution finished#{format_elapsed(details)}"
+
+      "execution_turn_failed" ->
+        "#{prefix} execution failed#{format_elapsed(details)}: #{details[:reason] || details["reason"]}"
+
+      "routing_selected" ->
+        "#{prefix} routed to #{details[:provider] || details["provider"]}/#{details[:model] || details["model"]}"
+
+      "session_started" ->
+        "#{prefix} model session started"
+
+      "demo_capture_started" ->
+        "#{prefix} demo capture started"
+
+      "demo_capture_repair_requested" ->
+        "#{prefix} demo plan repair requested"
+
+      "demo_capture_succeeded" ->
+        "#{prefix} demo capture succeeded#{format_elapsed(details)}"
+
+      "demo_capture_skipped" ->
+        "#{prefix} demo capture skipped"
+
+      "demo_capture_failed" ->
+        "#{prefix} demo capture failed#{format_elapsed(details)}: #{details[:reason] || details["reason"]}"
+
+      "run_finished" ->
+        "#{prefix} run finished (#{details[:outcome] || details["outcome"]})"
+
+      "run_failed" ->
+        "#{prefix} run failed: #{details[:reason] || details["reason"]}"
+
+      "tracker_marked_in_review" ->
+        "#{prefix} moved to In Review"
+
+      "tracker_marked_done" ->
+        "#{prefix} moved to Done"
+
+      "review_pr_merged_from_done" ->
+        "#{prefix} merged review PR"
+
+      "clarification_requested" ->
+        "#{prefix} clarification requested"
+
+      "retry_scheduled" ->
+        "#{prefix} retry scheduled"
+
+      _ ->
+        nil
+    end
+  end
+
+  defp format_elapsed(details) do
+    value = details[:elapsed_ms] || details["elapsed_ms"]
+
+    if is_integer(value) and value >= 0 do
+      " in #{Float.round(value / 1000, 1)}s"
+    else
+      ""
+    end
   end
 
   defp issue_lookup(state, issue_identifier) do
@@ -1231,5 +1947,40 @@ defmodule Symphony.Orchestrator do
     state.running
     |> Map.values()
     |> Enum.find_value(fn entry -> if entry.issue_identifier == issue_identifier, do: entry.issue.id end)
+  end
+
+  defp clarification_requested?({:clarification_requested, _}), do: true
+  defp clarification_requested?(_), do: false
+
+  defp non_retryable_failure?({:demo_plan_invalid, _}), do: true
+  defp non_retryable_failure?({:recording_capture_failed, _}), do: true
+  defp non_retryable_failure?({:recording_setup_failed, _}), do: true
+  defp non_retryable_failure?(:recording_setup_command_missing), do: true
+  defp non_retryable_failure?(_), do: false
+
+  defp github_repo_slug_from_config(config) do
+    config.github_webhook_repo || parse_repo_slug(System.get_env("GITHUB_REPO_URL"))
+  end
+
+  defp parse_repo_slug(nil), do: nil
+
+  defp parse_repo_slug(url) when is_binary(url) do
+    normalized =
+      url
+      |> String.trim()
+      |> String.replace_suffix(".git", "")
+
+    cond do
+      Regex.match?(~r{^https://github\.com/[^/]+/[^/]+$}, normalized) ->
+        [_, owner, repo] = Regex.run(~r{^https://github\.com/([^/]+)/([^/]+)$}, normalized)
+        "#{owner}/#{repo}"
+
+      Regex.match?(~r{^git@github\.com:[^/]+/[^/]+$}, normalized) ->
+        [_, owner, repo] = Regex.run(~r{^git@github\.com:([^/]+)/([^/]+)$}, normalized)
+        "#{owner}/#{repo}"
+
+      true ->
+        nil
+    end
   end
 end

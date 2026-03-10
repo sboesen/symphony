@@ -1,9 +1,9 @@
 defmodule Symphony.Runner do
   @moduledoc "Dispatches turns to explicit execution backends (Codex app-server or OpenCode)."
 
-  alias Symphony.{CodexAppServer, OpenCodeRunner, OpenCodeServerRunner}
+  alias Symphony.{CodexAppServer, CodexExecRunner, OpenCodeRunner, OpenCodeServerRunner}
 
-  @supported_backends ["codex_app_server", "opencode", "opencode_server"]
+  @supported_backends ["codex_app_server", "codex_exec", "opencode", "opencode_server"]
 
   def run_turn(workspace_path, config, issue, attempt, prompt, routing, on_update)
       when is_function(on_update, 1) do
@@ -83,6 +83,10 @@ defmodule Symphony.Runner do
 
   defp run_with_backend("codex_app_server", workspace_path, config, issue, attempt, prompt, routing, on_update) do
     CodexAppServer.run_turn(workspace_path, config, issue, attempt, prompt, routing, on_update)
+  end
+
+  defp run_with_backend("codex_exec", workspace_path, config, issue, attempt, prompt, routing, on_update) do
+    CodexExecRunner.run_turn(workspace_path, config, issue, attempt, prompt, routing, on_update)
   end
 
   defp run_with_backend("opencode", workspace_path, config, issue, attempt, prompt, routing, on_update) do

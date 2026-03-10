@@ -49,4 +49,94 @@ defmodule Symphony.StatusRouterTest do
 
     assert conn.status == 404
   end
+
+  test "known issue status returns JSON payload" do
+    conn = conn(:get, "/status/TEST-1")
+    conn = Symphony.StatusRouter.call(conn, [])
+
+    assert conn.status == 200
+
+    payload = Jason.decode!(conn.resp_body)
+    assert payload["issue_identifier"] == "TEST-1"
+  end
+
+  test "refresh endpoint returns orchestrator payload" do
+    conn = Symphony.StatusRouter.call(conn(:post, "/api/v1/refresh"), [])
+
+    assert conn.status == 200
+
+    payload = Jason.decode!(conn.resp_body)
+    assert payload["ok"] == true
+    assert is_boolean(payload["payload"]["paused"])
+  end
+
+  test "retry and cancel endpoints surface orchestrator errors" do
+    retry_conn = Symphony.StatusRouter.call(conn(:post, "/api/v1/issues/TEST-404/retry"), [])
+    assert retry_conn.status == 422
+    assert Jason.decode!(retry_conn.resp_body) == %{"ok" => false, "error" => ":issue_not_found"}
+
+    cancel_conn = Symphony.StatusRouter.call(conn(:post, "/api/v1/issues/TEST-404/cancel"), [])
+    assert cancel_conn.status == 422
+    assert Jason.decode!(cancel_conn.resp_body) == %{"ok" => false, "error" => ":issue_not_running"}
+  end
+
+  test "github webhook endpoint returns handled payload for signed requests" do
+    body = Jason.encode!(%{"zen" => "keep it logically awesome"})
+
+    conn =
+      conn(:post, "/api/v1/github/webhook", body)
+      |> Plug.Conn.assign(:raw_body, body)
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Plug.Conn.put_req_header("x-github-event", "ping")
+      |> Plug.Conn.put_req_header("x-hub-signature-256", github_signature(body))
+      |> Symphony.StatusRouter.call([])
+
+    assert conn.status == 200
+
+    payload = Jason.decode!(conn.resp_body)
+    assert payload == %{"ok" => true, "payload" => %{"handled" => false, "reason" => "unsupported_event"}}
+  end
+
+  test "github webhook session endpoint rejects stale session ids" do
+    body = Jason.encode!(%{"action" => "ping"})
+
+    conn =
+      conn(:post, "/api/v1/github/webhook/stale-session", body)
+      |> Plug.Conn.assign(:raw_body, body)
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Plug.Conn.put_req_header("x-github-event", "ping")
+      |> Plug.Conn.put_req_header("x-hub-signature-256", github_signature(body))
+      |> Symphony.StatusRouter.call([])
+
+    assert conn.status == 422
+    assert Jason.decode!(conn.resp_body) == %{"ok" => false, "error" => ":invalid_webhook_session"}
+  end
+
+  test "linear webhook endpoint returns handled payload for signed requests" do
+    config = Symphony.Orchestrator.current_config()
+    body = Jason.encode!(%{"action" => "comment", "data" => %{"body" => "hello"}})
+
+    conn =
+      conn(:post, "/api/v1/linear/webhook", body)
+      |> Plug.Conn.assign(:raw_body, body)
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Plug.Conn.put_req_header("linear-signature", linear_signature(config.linear_webhook_secret, body))
+      |> Symphony.StatusRouter.call([])
+
+    assert conn.status == 200
+
+    payload = Jason.decode!(conn.resp_body)
+    assert payload["ok"] == true
+    assert payload["payload"]["handled"] == true
+    assert payload["payload"]["event_type"] == "comment"
+  end
+
+  defp github_signature(raw_body) do
+    digest = :crypto.mac(:hmac, :sha256, "test-secret", raw_body) |> Base.encode16(case: :lower)
+    "sha256=" <> digest
+  end
+
+  defp linear_signature(secret, raw_body) do
+    :crypto.mac(:hmac, :sha256, secret, raw_body) |> Base.encode16(case: :lower)
+  end
 end

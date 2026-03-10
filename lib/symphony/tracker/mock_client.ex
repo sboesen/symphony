@@ -38,9 +38,11 @@ defmodule Symphony.Tracker.MockClient do
     fetch_by_states(config, terminal_states)
   end
 
-  def mark_started(_config, _issue_id), do: :ok
-  def mark_in_review(_config, _issue_id), do: :ok
-  def mark_done(_config, _issue_id), do: :ok
+  def mark_started(_config, issue_id), do: notify_test_listener({:mark_started, issue_id})
+  def mark_todo(_config, issue_id), do: notify_test_listener({:mark_todo, issue_id})
+  def mark_backlog(_config, issue_id), do: notify_test_listener({:mark_backlog, issue_id})
+  def mark_in_review(_config, issue_id), do: notify_test_listener({:mark_in_review, issue_id})
+  def mark_done(_config, issue_id), do: notify_test_listener({:mark_done, issue_id})
 
   defp fetch_by_states(config, states) do
     wanted_states = normalize_state_set(states)
@@ -123,5 +125,13 @@ defmodule Symphony.Tracker.MockClient do
     else
       Path.expand(path, File.cwd!())
     end
+  end
+
+  defp notify_test_listener(message) do
+    if is_pid(Process.get(:symphony_tracker_test_pid)) do
+      send(Process.get(:symphony_tracker_test_pid), message)
+    end
+
+    :ok
   end
 end

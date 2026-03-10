@@ -16,7 +16,12 @@ defmodule Symphony.Broker do
   def current do
     case Process.whereis(__MODULE__) do
       nil -> %{owner: false, broker_port: @broker_port, sessions: []}
-      _pid -> GenServer.call(__MODULE__, :current)
+      _pid ->
+        try do
+          GenServer.call(__MODULE__, :current, 250)
+        catch
+          :exit, _ -> %{owner: false, broker_port: @broker_port, sessions: []}
+        end
     end
   end
 
@@ -40,6 +45,10 @@ defmodule Symphony.Broker do
 
   def forward_github_webhook(raw_body, headers, payload) do
     GenServer.call(__MODULE__, {:forward_webhook, raw_body, headers, payload}, 15_000)
+  end
+
+  def forward_linear_webhook(project_slug, raw_body, headers, payload) do
+    GenServer.call(__MODULE__, {:forward_linear_webhook, project_slug, raw_body, headers, payload}, 15_000)
   end
 
   @impl true
@@ -84,6 +93,8 @@ defmodule Symphony.Broker do
         session_id: session_id,
         repo: payload["repo"] || payload[:repo],
         callback_url: payload["callback_url"] || payload[:callback_url],
+        linear_callback_url: payload["linear_callback_url"] || payload[:linear_callback_url],
+        project_slug: payload["project_slug"] || payload[:project_slug],
         process_id: payload["process_id"] || payload[:process_id],
         issue_identifiers: payload["issue_identifiers"] || payload[:issue_identifiers] || [],
         last_seen_ms: now_ms()
@@ -107,6 +118,13 @@ defmodule Symphony.Broker do
           updated =
             session
             |> Map.put(:last_seen_ms, now_ms())
+            |> Map.put(:repo, payload["repo"] || payload[:repo] || session.repo)
+            |> Map.put(:callback_url, payload["callback_url"] || payload[:callback_url] || session.callback_url)
+            |> Map.put(
+              :linear_callback_url,
+              payload["linear_callback_url"] || payload[:linear_callback_url] || session.linear_callback_url
+            )
+            |> Map.put(:project_slug, payload["project_slug"] || payload[:project_slug] || session.project_slug)
             |> Map.put(:issue_identifiers, payload["issue_identifiers"] || payload[:issue_identifiers] || session.issue_identifiers)
 
           %{state | sessions: Map.put(state.sessions, session_id, updated)}
@@ -141,7 +159,54 @@ defmodule Symphony.Broker do
         }
       end)
 
-    {:reply, {:ok, %{forwarded: length(matched), repo: repo, results: results}}, state}
+    direct_result =
+      case fallback_direct_result(matched, results, payload, headers, raw_body) do
+        nil -> nil
+        result -> result
+      end
+
+    {:reply,
+     {:ok,
+      %{
+        forwarded: length(matched),
+        repo: repo,
+        issue_identifier: issue_identifier,
+        results: results,
+        direct_result: direct_result
+      }}, state}
+  end
+
+  def handle_call({:forward_linear_webhook, project_slug, raw_body, headers, payload}, _from, state) do
+    matched =
+      state.sessions
+      |> Map.values()
+      |> Enum.filter(fn session ->
+        is_binary(session.linear_callback_url) and session.linear_callback_url != "" and
+          normalize_project_slug(session.project_slug) == normalize_project_slug(project_slug)
+      end)
+
+    results =
+      Enum.map(matched, fn session ->
+        %{
+          session_id: session.session_id,
+          response: forward_to_session(session.linear_callback_url, raw_body, headers, :linear)
+        }
+      end)
+
+    direct_result =
+      case fallback_direct_linear_result(matched, results, payload, headers, raw_body, project_slug) do
+        nil -> nil
+        result -> result
+      end
+
+    {:reply,
+     {:ok,
+      %{
+        forwarded: length(matched),
+        project_slug: project_slug,
+        results: results,
+        direct_result: direct_result
+      }}, state}
   end
 
   @impl true
@@ -164,6 +229,9 @@ defmodule Symphony.Broker do
       broker_alive?() ->
         state
 
+      broker_port_available?() == false ->
+        %{state | last_error: nil}
+
       true ->
         case Plug.Cowboy.http(Symphony.BrokerRouter, [], ip: {127, 0, 0, 1}, port: @broker_port, ref: @cowboy_ref) do
           {:ok, _pid} ->
@@ -180,13 +248,19 @@ defmodule Symphony.Broker do
     with {:ok, config} <- current_config(),
          port when is_integer(port) and port > 0 <- config.server_port do
       callback_url = "http://127.0.0.1:#{port}/api/v1/github/webhook/#{state.session_id}"
+      linear_callback_url =
+        "http://127.0.0.1:#{port}/api/v1/linear/webhook/#{config.tracker_project_slug}"
+
       repo = config.github_webhook_repo
+      project_slug = config.tracker_project_slug
       issues = local_issue_identifiers(config)
 
       payload = %{
         session_id: state.session_id,
         repo: repo,
         callback_url: callback_url,
+        linear_callback_url: linear_callback_url,
+        project_slug: project_slug,
         process_id: inspect(self()),
         issue_identifiers: issues
       }
@@ -196,6 +270,8 @@ defmodule Symphony.Broker do
           session_id: state.session_id,
           repo: repo,
           callback_url: callback_url,
+          linear_callback_url: linear_callback_url,
+          project_slug: project_slug,
           process_id: inspect(self()),
           issue_identifiers: issues,
           last_seen_ms: now_ms()
@@ -241,11 +317,32 @@ defmodule Symphony.Broker do
     end
   end
 
+  defp broker_port_available? do
+    case :gen_tcp.listen(@broker_port, [:binary, {:packet, 0}, {:active, false}, {:ip, {127, 0, 0, 1}}]) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+        true
+
+      {:error, :eaddrinuse} ->
+        false
+
+      {:error, _reason} ->
+        true
+    end
+  end
+
   defp forward_to_session(url, raw_body, headers) do
+    forward_to_session(url, raw_body, headers, :github)
+  end
+
+  defp forward_to_session(url, raw_body, headers, provider) do
     outbound_headers =
       headers
       |> Enum.filter(fn {key, _} ->
-        key in ["content-type", "x-github-event", "x-hub-signature-256"]
+        case provider do
+          :linear -> key in ["content-type", "linear-signature", "linear-event"]
+          _ -> key in ["content-type", "x-github-event", "x-hub-signature-256"]
+        end
       end)
 
     request = Finch.build(:post, url, outbound_headers, raw_body)
@@ -296,6 +393,35 @@ defmodule Symphony.Broker do
     issues == [] or issue_identifier in issues
   end
 
+  defp fallback_direct_result(matched, results, payload, headers, raw_body) do
+    if matched == [] or Enum.all?(results, &(not successful_forward?(&1.response))) do
+      case Symphony.GitHubWebhook.handle_payload(payload, normalize_headers(headers), raw_body) do
+        {:ok, result} -> %{ok: true, payload: result}
+        {:error, reason} -> %{ok: false, error: inspect(reason)}
+      end
+    else
+      nil
+    end
+  end
+
+  defp fallback_direct_linear_result(matched, results, payload, headers, raw_body, project_slug) do
+    if matched == [] or Enum.all?(results, &(not successful_forward?(&1.response))) do
+      case Symphony.LinearWebhook.handle_payload(payload, normalize_headers(headers), raw_body, project_slug) do
+        {:ok, result} -> %{ok: true, payload: result}
+        {:error, reason} -> %{ok: false, error: inspect(reason)}
+      end
+    else
+      nil
+    end
+  end
+
+  defp successful_forward?(%{status: status}) when is_integer(status), do: status in 200..299
+  defp successful_forward?(_), do: false
+
+  defp normalize_headers(headers) when is_list(headers) do
+    Map.new(headers, fn {key, value} -> {String.downcase(key), value} end)
+  end
+
   defp extract_issue_identifier(%{"pull_request" => pr}) when is_map(pr) do
     title = to_string(pr["title"] || "")
     body = to_string(pr["body"] || "")
@@ -320,6 +446,12 @@ defmodule Symphony.Broker do
 
   defp random_session_id do
     :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
+  end
+
+  defp normalize_project_slug(nil), do: nil
+
+  defp normalize_project_slug(value) when is_binary(value) do
+    value |> String.trim() |> String.downcase()
   end
 
   defp now_ms, do: System.monotonic_time(:millisecond)

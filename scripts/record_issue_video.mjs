@@ -144,20 +144,19 @@ function resolveSourceUrl(planUrl, fallbackUrl) {
   }
 
   try {
-    const fallbackParsed = new URL(fallback);
-    const parsed = new URL(candidate, fallback);
+    const resolved = new URL(candidate, fallback);
 
-    if (
-      isLoopbackHost(parsed.hostname) &&
-      isLoopbackHost(fallbackParsed.hostname) &&
-      parsed.origin !== fallbackParsed.origin &&
-      parsed.port === "3000"
-    ) {
-      const redirected = new URL(parsed.pathname + parsed.search + parsed.hash, fallbackParsed);
-      return redirected.toString();
+    if (fallback) {
+      const fallbackUrlObject = new URL(fallback);
+      if (isLoopbackHost(resolved.hostname) && isLoopbackHost(fallbackUrlObject.hostname)) {
+        return new URL(
+          `${resolved.pathname || "/"}${resolved.search || ""}${resolved.hash || ""}`,
+          fallbackUrlObject
+        ).toString();
+      }
     }
 
-    return parsed.toString();
+    return resolved.toString();
   } catch {
     return candidate;
   }
@@ -197,7 +196,7 @@ async function waitForPageState(page, args) {
   }
 }
 
-async function runPlan(page, plan) {
+async function runPlan(page, plan, baseUrl) {
   const steps = Array.isArray(plan?.steps) ? plan.steps : [];
 
   for (const step of steps) {
@@ -209,7 +208,7 @@ async function runPlan(page, plan) {
 
     switch (action) {
       case "goto": {
-        const target = `${step.url || ""}`.trim();
+        const target = resolveSourceUrl(step.url, baseUrl);
         if (!target) {
           throw new Error("demo plan goto step requires url");
         }
@@ -451,6 +450,9 @@ async function main() {
   const fallbackUrl = requireArg(args, "url");
   const planFile = args["plan-file"];
   const plan = await loadPlan(planFile);
+  const captureType = `${plan?.capture || "video"}`.trim().toLowerCase() === "screenshot"
+    ? "screenshot"
+    : "video";
   const sourceUrl = resolveSourceUrl(plan?.url, fallbackUrl);
   const outputDir = path.resolve(requireArg(args, "output-dir"));
   const settleMs = parseInteger(plan?.settle_ms ?? args["settle-ms"], 2_000);
@@ -467,16 +469,21 @@ async function main() {
   await ensureDir(outputDir);
 
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    viewport: { width, height },
-    recordVideo: {
+  const contextOptions = {
+    viewport: { width, height }
+  };
+
+  if (captureType === "video") {
+    contextOptions.recordVideo = {
       dir: outputDir,
       size: { width, height }
-    }
-  });
+    };
+  }
+
+  const context = await browser.newContext(contextOptions);
 
   const page = await context.newPage();
-  const video = page.video();
+  const video = captureType === "video" ? page.video() : null;
   const consoleErrors = [];
   page.on("console", (message) => {
     if (message.type() === "error") {
@@ -501,21 +508,29 @@ async function main() {
     if (plan?.non_demoable === true) {
       status = "skipped";
     } else {
+      const preCaptureWaitArgs = captureType === "screenshot"
+        ? {
+            "wait-for-selector": plan?.wait_for_selector,
+            "wait-for-text": plan?.wait_for_text
+          }
+        : {
+            "wait-for-selector": plan?.wait_for_selector ?? args["wait-for-selector"],
+            "wait-for-text": plan?.wait_for_text ?? args["wait-for-text"]
+          };
+
       await page.goto(sourceUrl, { waitUntil: "load", timeout: 30_000 });
-      await waitForPageState(page, {
-        ...args,
-        "wait-for-selector": plan?.wait_for_selector ?? args["wait-for-selector"],
-        "wait-for-text": plan?.wait_for_text ?? args["wait-for-text"]
-      });
-      await runPlan(page, plan);
+      await waitForPageState(page, preCaptureWaitArgs);
+      await runPlan(page, plan, sourceUrl);
       finalPageUrl = page.url();
-      verification = await verifyAssertions(page, {
-        ...(plan || {}),
-        console_errors: consoleErrors
-      });
-      await fs.writeFile(`${verificationPath}`, `${JSON.stringify(verification, null, 2)}\n`, "utf8");
-      if (!verification.passed) {
-        throw new Error(`demo plan assertions failed: ${JSON.stringify(verification.results)}`);
+      if (captureType === "video") {
+        verification = await verifyAssertions(page, {
+          ...(plan || {}),
+          console_errors: consoleErrors
+        });
+        await fs.writeFile(`${verificationPath}`, `${JSON.stringify(verification, null, 2)}\n`, "utf8");
+        if (!verification.passed) {
+          throw new Error(`demo plan assertions failed: ${JSON.stringify(verification.results)}`);
+        }
       }
       await page.waitForTimeout(settleMs);
       await page.screenshot({ path: screenshotPath });
@@ -536,7 +551,7 @@ async function main() {
   let rawVideoPath = null;
   let finalVideo = null;
   try {
-    if (status !== "skipped") {
+    if (status !== "skipped" && captureType === "video" && video) {
       rawVideoPath = await video.path();
       await transcodeToMp4(rawVideoPath, finalVideoPath);
       finalVideo = finalVideoPath;
@@ -548,6 +563,7 @@ async function main() {
 
   const manifest = {
     manifest_version: MANIFEST_VERSION,
+    capture_type: captureType,
     status,
     source_url: sourceUrl,
     output_dir: outputDir,
@@ -557,7 +573,7 @@ async function main() {
     screenshot_path: screenshotPath,
     verification_path: verification.results.length > 0 ? verificationPath : null,
     demo_plan_path: planFile ? path.resolve(planFile) : null,
-    assertions: Array.isArray(plan?.assertions) ? plan.assertions : [],
+    assertions: captureType === "video" && Array.isArray(plan?.assertions) ? plan.assertions : [],
     verification,
     current_url: status === "skipped" ? null : finalPageUrl || sourceUrl,
     console_errors: consoleErrors,

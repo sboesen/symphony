@@ -55,6 +55,61 @@ defmodule Symphony.GitReview do
     end
   end
 
+  def merge_review_pr(workspace_path, review_artifact) when is_map(review_artifact) do
+    with repo_slug when is_binary(repo_slug) <- review_artifact[:repo_slug] || review_artifact["repo_slug"],
+         pr_number when is_integer(pr_number) <- review_artifact[:pr_number] || review_artifact["pr_number"],
+         :ok <- ensure_pr_mergeable(workspace_path, repo_slug, pr_number),
+         {:ok, merge_state} <- merge_now(workspace_path, repo_slug, pr_number) do
+      {:ok,
+       review_artifact
+       |> Map.put(:auto_merge_enabled, false)
+       |> Map.put(:pr_merged, merge_state.pr_merged)}
+    else
+      nil -> {:error, :review_pr_missing_metadata}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :review_pr_missing_metadata}
+    end
+  end
+
+  def find_open_review_pr(repo_slug, issue_identifier) when is_binary(repo_slug) and is_binary(issue_identifier) do
+    query = "#{issue_identifier} in:title"
+
+    case run_gh(default_cwd(), [
+           "pr",
+           "list",
+           "--repo",
+           repo_slug,
+           "--state",
+           "open",
+           "--search",
+           query,
+           "--json",
+           "number,url,headRefName"
+         ]) do
+      {:ok, raw} ->
+        with {:ok, decoded} <- Jason.decode(raw),
+             [first | _] <- decoded do
+          {:ok,
+           %{
+             kind: "pull_request",
+             status: "ready",
+             repo_slug: repo_slug,
+             pr_number: first["number"],
+             pr_url: first["url"],
+             branch: first["headRefName"],
+             auto_merge_enabled: false,
+             pr_merged: false
+           }}
+        else
+          [] -> {:error, :pr_not_found}
+          _ -> {:error, :pr_lookup_failed}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   def enabled?(config) do
     config.review_pr_enabled == true
   end
@@ -175,10 +230,19 @@ defmodule Symphony.GitReview do
 
   defp commit_and_push(%Issue{} = issue, workspace_path, branch_info) do
     with {:ok, _} <- run_git(workspace_path, ["add", "-A"]),
+         :ok <- unstage_ephemeral_paths(workspace_path),
          {:ok, changed?} <- staged_changes?(workspace_path),
          {:ok, commit_sha} <- maybe_commit(issue, workspace_path, changed?),
          {:ok, _} <- run_git(workspace_path, ["push", "-u", "origin", branch_info.branch]) do
       {:ok, commit_sha, changed?}
+    end
+  end
+
+  defp unstage_ephemeral_paths(workspace_path) do
+    case run_git(workspace_path, ["reset", "HEAD", "--", ".symphony"]) do
+      {:ok, _} -> :ok
+      {:error, {:exit_status, 128, _}} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -371,11 +435,58 @@ defmodule Symphony.GitReview do
       {:ok, _} ->
         {:ok, %{auto_merge_enabled: false, pr_merged: true}}
 
-      {:error, {:exit_status, _status, output}} ->
-        {:error, {:pr_merge_failed, output}}
+      {:error, {:exit_status, _status, output}} when is_binary(output) ->
+        if String.contains?(output, "--auto") or
+             String.contains?(String.downcase(output), "auto-merge") do
+          case run_gh(workspace_path, [
+                 "pr",
+                 "merge",
+                 Integer.to_string(pr_number),
+                 "--repo",
+                 repo_slug,
+                 "--auto",
+                 "--squash"
+               ]) do
+            {:ok, _} ->
+              {:ok, %{auto_merge_enabled: true, pr_merged: false}}
+
+            {:error, {:exit_status, _status, auto_output}} ->
+              {:error, {:pr_merge_failed, auto_output}}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+        else
+          {:error, {:pr_merge_failed, output}}
+        end
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp ensure_pr_mergeable(workspace_path, repo_slug, pr_number) do
+    case run_gh(workspace_path, [
+           "pr",
+           "view",
+           Integer.to_string(pr_number),
+           "--repo",
+           repo_slug,
+           "--json",
+           "mergeStateStatus"
+         ]) do
+      {:ok, raw} ->
+        with {:ok, decoded} <- Jason.decode(raw) do
+          case String.upcase(to_string(decoded["mergeStateStatus"] || "")) do
+            "DIRTY" -> {:error, {:pr_merge_blocked, :dirty}}
+            _ -> :ok
+          end
+        else
+          _ -> :ok
+        end
+
+      {:error, _reason} ->
+        :ok
     end
   end
 
@@ -456,5 +567,9 @@ defmodule Symphony.GitReview do
   rescue
     error ->
       {:error, {:command_exception, command, Exception.message(error)}}
+  end
+
+  defp default_cwd do
+    File.cwd!()
   end
 end

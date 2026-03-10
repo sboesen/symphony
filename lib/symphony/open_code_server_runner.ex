@@ -20,7 +20,7 @@ defmodule Symphony.OpenCodeServerRunner do
           :stderr_to_stdout,
           {:args, ["-lc", server_command]},
           {:cd, workspace_path},
-          {:env, opencode_env(config, routing)}
+          {:env, opencode_env(workspace_path, config, routing)}
         ]
       )
 
@@ -579,7 +579,7 @@ defmodule Symphony.OpenCodeServerRunner do
     end
   end
 
-  defp opencode_env(config, routing) do
+  defp opencode_env(workspace_path, config, routing) do
     profile = provider_profile(config, routing)
     auth_mode = resolve_auth_mode(profile)
 
@@ -593,11 +593,19 @@ defmodule Symphony.OpenCodeServerRunner do
         end
       end)
 
-    env
+    env =
+      env
     |> maybe_put_env("OPENAI_API_KEY", api_key_for_env(profile, config, auth_mode))
     |> maybe_put_env("Z_API_KEY", z_api_key_for_env(profile, config, auth_mode))
     |> maybe_put_env("OPENAI_BASE_URL", base_url_for_env(profile, config, auth_mode))
     |> Map.merge(profile[:env] || %{})
+
+    Symphony.OpenCodeRuntime.build_env(workspace_path, env, %{
+      model: normalize_model(profile[:model]),
+      provider_id: provider_id(profile[:name], profile[:model]),
+      api_key: profile[:z_api_key] || profile[:api_key] || config.zai_api_key || config.openai_api_key,
+      base_url: base_url_for_env(profile, config, auth_mode)
+    })
     |> Enum.map(fn {key, value} -> {String.to_charlist(key), String.to_charlist(value)} end)
   end
 
@@ -648,6 +656,18 @@ defmodule Symphony.OpenCodeServerRunner do
   end
 
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp provider_id(name, model) when is_binary(model) do
+    case String.split(model, "/", parts: 2) do
+      [provider, _] when provider != "" -> provider
+      _ -> provider_id(name, nil)
+    end
+  end
+
+  defp provider_id("zai", _), do: "zai-coding-plan"
+  defp provider_id("codex", _), do: "openai"
+  defp provider_id(name, _) when is_binary(name), do: name
+  defp provider_id(_, _), do: nil
 
   defp close_port(port) do
     if is_port(port) and Port.info(port) != nil do

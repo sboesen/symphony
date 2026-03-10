@@ -8,14 +8,12 @@ tracker:
   terminal_states: [Closed, Done, Cancelled, Canceled, Duplicate]
 polling:
   enabled: false
-  # This is a slow reconciliation safety net. Normal scheduling should be driven
-  # by Linear and GitHub webhooks, not by frequent polling.
   interval_ms: 300000
 workspace:
   root: /tmp/symphony-e2e/workspaces
 hooks:
   after_create: |
-    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [ ! -d .git ]; then
       : "${GITHUB_REPO_URL:?set via --repo or GITHUB_REPO_URL}"
       git clone "$GITHUB_REPO_URL" .
       if [ -n "${GIT_DEFAULT_BRANCH:-}" ]; then
@@ -27,61 +25,48 @@ agent:
   max_turns: 1
   max_retry_backoff_ms: 10000
 codex:
-  command: codex app-server
+  command: codex
   providers:
-    zai:
-      backend: opencode
-      command: opencode
-      auth_mode: api_key
-      api_key: $Z_API_KEY
-      base_url: https://api.z.ai/api/coding/paas/v4
-      model: zai-coding-plan/glm-5
     codex:
-      backend: codex_app_server
-      command: codex app-server
-      auth_mode: app_server
-      model: codex-5-3
+      backend: codex_exec
+      command: codex
+      auth_mode: api_key
+      api_key: $OPENAI_API_KEY
+      model: gpt-5-codex
   router:
     enabled: true
-    default_provider: zai
+    default_provider: codex
     hard_provider: codex
-    default_model: zai-coding-plan/glm-5
-    hard_model: codex-5-3
+    default_model: gpt-5-codex
+    hard_model: gpt-5-codex
     hard_effort: xhigh
     hard_percentile: 95
 server:
   port: 4012
-  # The operator dashboard and status APIs are local-only by design.
-  # There is no built-in auth layer yet, so do not expose this port to untrusted networks.
 github:
   webhook:
-    # Local webhook ingress is handled by an embedded broker inside Symphony.
-    # Only one public endpoint is created per machine/process group, and later
-    # Symphony sessions register with that broker over localhost.
-    # When auto_register is enabled, Symphony will delete stale Symphony-managed
-    # GitHub webhooks for this repo before creating the current one.
     secret: $GITHUB_WEBHOOK_SECRET
     auto_register: $SYMPHONY_GITHUB_WEBHOOK_AUTO_REGISTER
     provider: ngrok
     repo: $GITHUB_WEBHOOK_REPO
 linear:
   webhook:
-    # Linear webhook registration follows the currently selected project.
-    # The default is to auto-register when the tracker project, secret, and ngrok are available.
     secret: $LINEAR_WEBHOOK_SECRET
     auto_register: $SYMPHONY_LINEAR_WEBHOOK_AUTO_REGISTER
 recording:
   enabled: true
   url: http://127.0.0.1:3000
   ready_url: http://127.0.0.1:3000
-  # When recording is enabled, the agent is expected to write a feature-specific
-  # demo plan to `.git/symphony/demo-plan.json`. The recorder will execute those
-  # steps instead of doing a generic page capture. The plan can also declare
-  # `non_demoable: true` for tasks that do not have a meaningful user-visible demo.
+  setup_command: |
+    if [ ! -d node_modules ]; then
+      npm install --no-fund --no-audit
+    fi
+    npm run dev -- --host 127.0.0.1 --port 3000
   output_dir: .symphony/artifacts/recordings
   wait_ms: 2500
+  ready_timeout_ms: 120000
   trace: true
-  strict: false
+  strict: true
   publish_to_tracker: true
   publish_comment: true
 review:

@@ -104,6 +104,42 @@ defmodule Symphony.StatusRouter do
     end
   end
 
+  post "/api/v1/linear/webhook" do
+    case Symphony.LinearWebhook.handle(conn, conn.body_params) do
+      {:ok, payload} ->
+        body = Jason.encode!(%{ok: true, payload: payload})
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, body)
+
+      {:error, reason} ->
+        body = Jason.encode!(%{ok: false, error: inspect(reason)})
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(422, body)
+    end
+  end
+
+  post "/api/v1/linear/webhook/:project_slug" do
+    case Symphony.LinearWebhook.handle(conn, conn.body_params, project_slug) do
+      {:ok, payload} ->
+        body = Jason.encode!(%{ok: true, payload: payload})
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, body)
+
+      {:error, reason} ->
+        body = Jason.encode!(%{ok: false, error: inspect(reason)})
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(422, body)
+    end
+  end
+
   match _ do
     send_resp(conn, 404, "not found")
   end
@@ -344,6 +380,7 @@ defmodule Symphony.StatusRouter do
               <div class="demo-block">
                 <strong>Demo</strong>
                 <div class="demo-grid">
+                  <span>capture: ${esc(demo.capture_type || 'video')}</span>
                   <span>status: ${esc(demo.status || 'unknown')}</span>
                   <span>assertions: ${esc(`${passed}/${demo.assertion_count ?? 0}`)}</span>
                   <span>plan: ${esc(demo.demo_plan_path || 'n/a')}</span>

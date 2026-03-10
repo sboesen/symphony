@@ -47,6 +47,18 @@ defmodule Symphony.BrokerRouter do
     )
   end
 
+  post "/linear/webhook/:project_slug" do
+    respond(
+      conn,
+      Symphony.Broker.forward_linear_webhook(
+        project_slug,
+        conn.assigns[:raw_body] || "",
+        conn.req_headers,
+        conn.body_params
+      )
+    )
+  end
+
   match _ do
     send_resp(conn, 404, "not found")
   end

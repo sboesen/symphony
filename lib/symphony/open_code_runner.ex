@@ -1,5 +1,8 @@
 defmodule Symphony.OpenCodeRunner do
   @moduledoc "Runs one turn through OpenCode CLI and streams JSON events."
+  @workspace_contract_grace_ms 2_000
+
+  alias Symphony.{CompletionResult, PlanContract}
 
   def run_turn(workspace_path, config, _issue, _attempt, prompt, routing, on_update)
       when is_function(on_update, 1) do
@@ -21,12 +24,14 @@ defmodule Symphony.OpenCodeRunner do
           :stderr_to_stdout,
           {:args, ["-lc", shell_command]},
           {:cd, workspace_path},
-          {:env, opencode_env(config, routing, prompt)}
+          {:env, opencode_env(workspace_path, config, routing, prompt)}
         ]
       )
 
     state = %{
       port: port,
+      workspace_path: workspace_path,
+      phase: infer_phase(prompt),
       deadline_ms: deadline,
       read_timeout_ms: read_timeout,
       usage: %{input_tokens: 0, output_tokens: 0, total_tokens: 0},
@@ -36,7 +41,8 @@ defmodule Symphony.OpenCodeRunner do
       error: nil,
       terminal_reason: nil,
       stall_timeout_ms: stall_timeout,
-      last_activity_ms: System.monotonic_time(:millisecond)
+      last_activity_ms: System.monotonic_time(:millisecond),
+      contract_ready_ms: nil
     }
 
     case await_completion(state, on_update) do
@@ -75,22 +81,28 @@ defmodule Symphony.OpenCodeRunner do
         {:error, :stall_timeout}
 
       true ->
-        state = process_queue(state, on_update)
+        state = process_queue(state, on_update) |> maybe_complete_from_workspace_contract()
 
-        receive do
-          {port, {:data, data}} when port == state.port ->
-            await_completion(enqueue_data(state, data), on_update)
+        if state.terminal_reason == :stop do
+          {:ok, 0, state}
+        else
+          receive do
+            {port, {:data, data}} when port == state.port ->
+              await_completion(enqueue_data(state, data), on_update)
 
-          {port, {:exit_status, status}} when port == state.port ->
-            final_state = process_queue(state, on_update)
-            {:ok, status, final_state}
-        after
-          state.read_timeout_ms ->
-            if state.terminal_reason == :stop do
-              {:ok, 0, state}
-            else
-              await_completion(state, on_update)
-            end
+            {port, {:exit_status, status}} when port == state.port ->
+              final_state = process_queue(state, on_update)
+              {:ok, status, final_state}
+          after
+            state.read_timeout_ms ->
+              state = maybe_complete_from_workspace_contract(state)
+
+              if state.terminal_reason == :stop do
+                {:ok, 0, state}
+              else
+                await_completion(state, on_update)
+              end
+          end
         end
     end
   end
@@ -162,8 +174,8 @@ defmodule Symphony.OpenCodeRunner do
         total_tokens:
           to_int(
             tokens["total"] || tokens["totalTokens"] ||
-              (to_int(tokens["input"] || tokens["inputTokens"]) +
-                 to_int(tokens["output"] || tokens["outputTokens"]))
+              to_int(tokens["input"] || tokens["inputTokens"]) +
+                to_int(tokens["output"] || tokens["outputTokens"])
           )
       }
     end
@@ -183,7 +195,12 @@ defmodule Symphony.OpenCodeRunner do
           {Enum.drop(parts, -1) |> Enum.reject(&(&1 == "")), List.last(parts) || ""}
       end
 
-    %{state | queue: state.queue ++ lines, buffer: buffer, last_activity_ms: System.monotonic_time(:millisecond)}
+    %{
+      state
+      | queue: state.queue ++ lines,
+        buffer: buffer,
+        last_activity_ms: System.monotonic_time(:millisecond)
+    }
   end
 
   defp to_binary_chunk({:eol, line}), do: IO.iodata_to_binary(line) <> "\n"
@@ -194,6 +211,95 @@ defmodule Symphony.OpenCodeRunner do
   defp stalled?(state) do
     System.monotonic_time(:millisecond) - state.last_activity_ms >= state.stall_timeout_ms
   end
+
+  defp maybe_complete_from_workspace_contract(%{terminal_reason: :stop} = state), do: state
+
+  defp maybe_complete_from_workspace_contract(state) do
+    if workspace_contract_satisfied?(state.workspace_path, state.phase) do
+      now = System.monotonic_time(:millisecond)
+
+      case state.contract_ready_ms do
+        nil ->
+          %{state | contract_ready_ms: now}
+
+        ready_ms when now - ready_ms >= @workspace_contract_grace_ms ->
+          %{state | terminal_reason: :stop}
+
+        _ ->
+          state
+      end
+    else
+      %{state | contract_ready_ms: nil}
+    end
+  end
+
+  defp workspace_contract_satisfied?(workspace_path, phase) do
+    case phase do
+      :plan ->
+        valid_plan_contract?(workspace_path)
+
+      :execution ->
+        valid_execution_contract?(workspace_path)
+
+      _ ->
+        false
+    end
+  end
+
+  defp valid_plan_contract?(workspace_path) do
+    with {:ok, plan} <- PlanContract.load(workspace_path),
+         true <- PlanContract.has_steps?(plan) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp valid_execution_contract?(workspace_path) do
+    with {:ok, plan} <- PlanContract.load(workspace_path),
+         true <- PlanContract.has_steps?(plan),
+         {:ok, result} <- CompletionResult.load(workspace_path),
+         true <- valid_completion_contract?(workspace_path, plan, result) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp valid_completion_contract?(workspace_path, plan, %{status: "completed"}) do
+    PlanContract.all_done?(plan) and
+      File.exists?(Path.join(workspace_path, ".git/symphony/demo-plan.json"))
+  end
+
+  defp valid_completion_contract?(_workspace_path, _plan, %{status: status})
+       when status in ["needs_more_work", "blocked"],
+       do: true
+
+  defp valid_completion_contract?(_workspace_path, _plan, _result), do: false
+
+  defp infer_phase(prompt) when is_binary(prompt) do
+    cond do
+      String.starts_with?(
+        prompt,
+        "Create the execution plan for this issue before implementation."
+      ) ->
+        :plan
+
+      String.starts_with?(
+        prompt,
+        "The Symphony execution plan does not match the issue target closely enough."
+      ) ->
+        :plan
+
+      String.contains?(prompt, "Update only `.git/symphony/plan.json`.") ->
+        :plan
+
+      true ->
+        :execution
+    end
+  end
+
+  defp infer_phase(_prompt), do: :execution
 
   defp close_port(port) do
     if is_port(port) and Port.info(port) != nil do
@@ -288,26 +394,39 @@ defmodule Symphony.OpenCodeRunner do
   defp resolve_variant(value) when is_binary(value), do: String.trim(value)
   defp resolve_variant(_), do: nil
 
-  defp opencode_env(config, routing, prompt) do
+  defp opencode_env(workspace_path, config, routing, prompt) do
     profile = provider_profile(config, routing)
     auth_mode = resolve_auth_mode(profile)
 
     env =
       System.get_env()
       |> Enum.reduce(%{}, fn {key, value}, acc ->
-        if is_binary(value) and String.trim(value) != "" do
-          Map.put(acc, key, value)
-        else
+        if key in ["OPENAI_API_KEY", "OPENAI_BASE_URL", "Z_API_KEY"] do
           acc
+        else
+          if is_binary(value) and String.trim(value) != "" do
+            Map.put(acc, key, value)
+          else
+            acc
+          end
         end
       end)
 
-    env
-    |> maybe_put_env("OPENAI_API_KEY", api_key_for_env(profile, config, auth_mode))
-    |> maybe_put_env("Z_API_KEY", z_api_key_for_env(profile, config, auth_mode))
-    |> maybe_put_env("OPENAI_BASE_URL", base_url_for_env(profile, config, auth_mode))
-    |> Map.merge(profile[:env] || %{})
-    |> Map.put("SYMPHONY_PROMPT", prompt)
+    env =
+      env
+      |> maybe_put_env("OPENAI_API_KEY", api_key_for_env(profile, config, auth_mode))
+      |> maybe_put_env("Z_API_KEY", z_api_key_for_env(profile, config, auth_mode))
+      |> maybe_put_env("OPENAI_BASE_URL", base_url_for_env(profile, config, auth_mode))
+      |> Map.merge(profile[:env] || %{})
+      |> Map.put("SYMPHONY_PROMPT", prompt)
+
+    Symphony.OpenCodeRuntime.build_env(workspace_path, env, %{
+      model: resolve_model(profile[:model], profile[:name]),
+      provider_id: provider_id(profile[:name], profile[:model]),
+      api_key:
+        profile[:z_api_key] || profile[:api_key] || config.zai_api_key || config.openai_api_key,
+      base_url: base_url_for_env(profile, config, auth_mode)
+    })
     |> Enum.map(fn {key, value} -> {String.to_charlist(key), String.to_charlist(value)} end)
   end
 
@@ -318,8 +437,14 @@ defmodule Symphony.OpenCodeRunner do
     %{
       name: provider_name,
       api_key: Map.get(configured, :api_key, config.openai_api_key),
-      z_api_key: Map.get(configured, :z_api_key, config.zai_api_key),
-      base_url: Map.get(configured, :base_url, config.openai_base_url),
+      z_api_key:
+        Map.get_lazy(configured, :z_api_key, fn ->
+          if provider_name == "zai", do: config.zai_api_key, else: nil
+        end),
+      base_url:
+        Map.get_lazy(configured, :base_url, fn ->
+          if provider_name == "zai", do: config.openai_base_url, else: nil
+        end),
       model_provider: Map.get(configured, :model_provider, config.codex_model_provider),
       model: Map.get(configured, :model, config.codex_model),
       auth_mode: Map.get(configured, :auth_mode),
@@ -349,6 +474,18 @@ defmodule Symphony.OpenCodeRunner do
   end
 
   defp maybe_put_env(env, _key, _), do: env
+
+  defp provider_id(name, model) when is_binary(model) do
+    case String.split(model, "/", parts: 2) do
+      [provider, _] when provider != "" -> provider
+      _ -> provider_id(name, nil)
+    end
+  end
+
+  defp provider_id("zai", _), do: "zai-coding-plan"
+  defp provider_id("codex", _), do: "openai"
+  defp provider_id(name, _) when is_binary(name), do: name
+  defp provider_id(_, _), do: nil
 
   defp to_int(nil), do: 0
   defp to_int(v) when is_integer(v), do: v

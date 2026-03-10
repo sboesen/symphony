@@ -39,4 +39,5 @@ defmodule Symphony.ConfigValidationTest do
 
     assert :ok = Symphony.Config.validate_dispatch(config)
   end
+
 end
