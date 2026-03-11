@@ -14,6 +14,7 @@ defmodule Symphony.ArtifactRecorderTest do
     bin_dir = Path.join(workspace, "bin")
     File.mkdir_p!(bin_dir)
     node_path = Path.join(bin_dir, "node")
+    npm_path = Path.join(bin_dir, "npm")
     original_path = System.get_env("PATH") || ""
 
     File.write!(
@@ -53,7 +54,46 @@ defmodule Symphony.ArtifactRecorderTest do
       """
     )
 
+    File.write!(
+      npm_path,
+      """
+      #!/bin/bash
+      if [ "$1" = "install" ]; then
+        mkdir -p "$PWD/node_modules"
+        exit 0
+      fi
+
+      if [ "$1" = "run" ] && [ "$2" = "dev" ]; then
+        shift 2
+        host="127.0.0.1"
+        port=""
+
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --host)
+              host="$2"
+              shift 2
+              ;;
+            --port)
+              port="$2"
+              shift 2
+              ;;
+            *)
+              shift
+              ;;
+          esac
+        done
+
+        printf "%s\\n" "$0 run dev --host $host --port $port $*" > "$PWD/npm_run_args.txt"
+        exec python3 -m http.server "$port" --bind "$host"
+      fi
+
+      exit 0
+      """
+    )
+
     File.chmod!(node_path, 0o755)
+    File.chmod!(npm_path, 0o755)
     System.put_env("PATH", bin_dir <> ":" <> original_path)
 
     html_path = Path.join(workspace, "demo.html")
@@ -199,5 +239,69 @@ defmodule Symphony.ArtifactRecorderTest do
     assert artifact.kind == "demo_artifact"
     assert artifact.status == "error"
     assert artifact.error =~ "recording_command_failed"
+  end
+
+  test "demo plan overrides trigger js dependency install and local port rebinding", %{
+    workspace: workspace
+  } do
+    System.put_env("FAKE_NODE_MODE", "success")
+
+    occupied_port = listen_on_ephemeral_port()
+
+    demo_plan_dir = Path.join(workspace, ".git/symphony")
+    File.mkdir_p!(demo_plan_dir)
+    File.write!(Path.join(workspace, "package.json"), ~s({"name":"demo","scripts":{"dev":"vite"}}))
+
+    File.write!(
+      Path.join(demo_plan_dir, "demo-plan.json"),
+      Jason.encode!(%{
+        "url" => "http://127.0.0.1:#{occupied_port}/",
+        "ready_url" => "http://127.0.0.1:#{occupied_port}/",
+        "setup_command" => "npm run dev"
+      })
+    )
+
+    config = %Symphony.Config{
+      recording_enabled: true,
+      recording_url: "ignored-by-plan",
+      recording_ready_timeout_ms: 6_000,
+      recording_wait_ms: 0,
+      recording_width: 1280,
+      recording_height: 720,
+      recording_trace: false,
+      hooks_timeout_ms: 2_000
+    }
+
+    issue = %Symphony.Issue{identifier: "TEST-1", title: "Artifact"}
+
+    try do
+      assert {:error, {:recording_capture_failed, :recording_ready_timeout}, [artifact]} =
+               ArtifactRecorder.capture(issue, 1, workspace, config)
+
+      assert artifact.status == "error"
+      assert File.exists?(Path.join(workspace, "node_modules"))
+
+      assert {:ok, args} = File.read(Path.join(workspace, "npm_run_args.txt"))
+      assert args =~ "--host localhost"
+      refute args =~ "--port #{occupied_port}"
+    after
+      close_listen_socket(occupied_port)
+    end
+  end
+
+  defp listen_on_ephemeral_port do
+    {:ok, socket} =
+      :gen_tcp.listen(0, [:binary, {:packet, 0}, {:active, false}, {:ip, {127, 0, 0, 1}}])
+
+    {:ok, {_addr, port}} = :inet.sockname(socket)
+    Process.put({__MODULE__, :occupied_socket, port}, socket)
+    port
+  end
+
+  defp close_listen_socket(port) do
+    case Process.delete({__MODULE__, :occupied_socket, port}) do
+      socket when is_port(socket) -> :gen_tcp.close(socket)
+      _ -> :ok
+    end
   end
 end

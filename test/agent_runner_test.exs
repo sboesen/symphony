@@ -14,6 +14,8 @@ defmodule Symphony.AgentRunnerTest do
     bin_dir = Path.join(root, "bin")
     File.mkdir_p!(bin_dir)
     opencode = Path.join(bin_dir, "opencode")
+    node = Path.join(bin_dir, "node")
+    original_path = System.get_env("PATH") || ""
 
     File.write!(
       opencode,
@@ -97,16 +99,51 @@ defmodule Symphony.AgentRunnerTest do
 
     File.chmod!(opencode, 0o755)
 
+    File.write!(
+      node,
+      """
+      #!/bin/bash
+      output_dir=""
+      while [ "$#" -gt 0 ]; do
+        if [ "$1" = "--output-dir" ]; then
+          output_dir="$2"
+          shift 2
+        else
+          shift
+        fi
+      done
+
+      mkdir -p "$output_dir"
+      cat > "$output_dir/manifest.json" <<'EOF'
+      {"capture_type":"video","status":"ready","source_url":"file:///demo.html","output_dir":"OUT","video_path":"OUT/demo.webm","raw_video_path":"OUT/raw.webm","trace_path":"OUT/trace.zip","screenshot_path":"OUT/final.png","verification_path":"OUT/verify.json","assertions":[],"verification":{"ok":true},"console_errors":[]}
+      EOF
+      python3 - "$output_dir/manifest.json" "$output_dir" <<'PY'
+      import pathlib, sys
+      path = pathlib.Path(sys.argv[1])
+      text = path.read_text()
+      path.write_text(text.replace("OUT", sys.argv[2]))
+      PY
+      exit 0
+      """
+    )
+
+    File.chmod!(node, 0o755)
+    System.put_env("PATH", bin_dir <> ":" <> original_path)
+
     on_exit(fn ->
       System.delete_env("FAKE_AGENT_MODE")
+      System.put_env("PATH", original_path)
       File.rm_rf!(root)
     end)
+
+    File.write!(Path.join(root, "demo.html"), "<html><body>demo</body></html>")
 
     %{
       root: root,
       workspace_root: workspace_root,
       mock_file: mock_file,
-      opencode: opencode
+      opencode: opencode,
+      demo_html: Path.join(root, "demo.html")
     }
   end
 
@@ -215,6 +252,30 @@ defmodule Symphony.AgentRunnerTest do
     assert_receive {:agent_run_result, "issue-1", {:ok, %{artifacts: []}}}
   end
 
+  test "run captures and returns demo artifacts when recording is enabled", ctx do
+    System.put_env("FAKE_AGENT_MODE", "success")
+
+    config =
+      base_config(ctx)
+      |> Map.put(:recording_enabled, true)
+      |> Map.put(:recording_url, ctx.demo_html)
+      |> Map.put(:recording_ready_timeout_ms, 1_000)
+      |> Map.put(:recording_wait_ms, 0)
+      |> Map.put(:recording_width, 1280)
+      |> Map.put(:recording_height, 720)
+      |> Map.put(:recording_trace, false)
+      |> Map.put(:recording_publish_to_tracker, true)
+
+    AgentRunner.run(issue(), 1, config, "Implement {{issue.identifier}}", self())
+
+    assert_receive {:agent_runtime_event, "issue-1", "demo_capture_started", %{attempts_left: 2}}
+    assert_receive {:agent_runtime_event, "issue-1", "demo_capture_succeeded", %{"status" => "ready"}}
+
+    assert_receive {:agent_run_result, "issue-1", {:ok, %{artifacts: [artifact]}}}
+    assert artifact.kind == "demo_artifact"
+    assert artifact.status == "ready"
+  end
+
   defp base_config(ctx) do
     %Symphony.Config{
       tracker_kind: "mock",
@@ -234,6 +295,12 @@ defmodule Symphony.AgentRunnerTest do
       stall_timeout_ms: 5_000,
       max_turns: 2,
       recording_enabled: false,
+      recording_url: nil,
+      recording_ready_timeout_ms: 1_000,
+      recording_wait_ms: 0,
+      recording_width: 1280,
+      recording_height: 720,
+      recording_trace: false,
       recording_publish_to_tracker: false,
       review_pr_enabled: false
     }

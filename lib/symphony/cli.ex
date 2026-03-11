@@ -2,6 +2,7 @@ defmodule Symphony.CLI do
   @moduledoc false
 
   alias Symphony.Config
+  alias Symphony.CLIRuntime
   alias Symphony.GitHubRepo
   alias Symphony.Tracker
   alias Symphony.Workflow
@@ -84,10 +85,10 @@ defmodule Symphony.CLI do
       end
 
     apply_runtime_overrides(parsed)
-    persist_runtime_context(parsed, workflow_path)
-    lock_file = project_lock_path(parsed.project_slug)
+    CLIRuntime.persist_runtime_context(parsed, workflow_path)
+    lock_file = CLIRuntime.project_lock_path(parsed.project_slug)
 
-    case acquire_project_lock(lock_file) do
+    case CLIRuntime.acquire_project_lock(lock_file) do
       :ok ->
         :ok
 
@@ -108,7 +109,7 @@ defmodule Symphony.CLI do
             Process.sleep(:infinity)
 
           {:error, reason} ->
-            release_project_lock(lock_file)
+            CLIRuntime.release_project_lock(lock_file)
             IO.puts("failed to start: #{inspect(reason)}")
             System.halt(1)
         end
@@ -124,7 +125,7 @@ defmodule Symphony.CLI do
            {:ok, body} <- File.read(path),
            {:ok, runtime} <- Jason.decode(body),
            project_slug when is_binary(project_slug) <- normalize_value(runtime["project_slug"]) do
-        project_lock_path(project_slug)
+        CLIRuntime.project_lock_path(project_slug)
       else
         _ -> nil
       end
@@ -156,7 +157,7 @@ defmodule Symphony.CLI do
       _ -> :ok
     end
 
-    if is_binary(lock_file), do: force_release_project_lock(lock_file)
+    if is_binary(lock_file), do: CLIRuntime.force_release_project_lock(lock_file)
 
     :ok
   after
@@ -374,104 +375,4 @@ defmodule Symphony.CLI do
     end
   end
 
-  defp persist_runtime_context(parsed, workflow_path) do
-    case normalize_value(System.get_env("SYMPHONY_RUNTIME_FILE")) do
-      nil ->
-        :ok
-
-      path ->
-        body =
-          Jason.encode!(%{
-            workflow_path: workflow_path,
-            project_slug: parsed.project_slug,
-            repo_url: parsed.repo_url
-          })
-
-        File.write(path, body)
-    end
-  end
-
-  defp project_lock_path(project_slug) when is_binary(project_slug) and project_slug != "" do
-    Path.join(System.tmp_dir!(), "symphony-project-#{project_slug}.lock")
-  end
-
-  defp project_lock_path(_), do: nil
-
-  defp acquire_project_lock(nil), do: :ok
-
-  defp acquire_project_lock(path) do
-    case File.read(path) do
-      {:ok, body} ->
-        case Integer.parse(String.trim(body)) do
-          {pid, ""} when pid > 0 ->
-            if pid_alive?(pid) do
-              {:error, {:already_running, pid}}
-            else
-              write_project_lock(path)
-            end
-
-          _ ->
-            write_project_lock(path)
-        end
-
-      _ ->
-        write_project_lock(path)
-    end
-  end
-
-  defp write_project_lock(path) do
-    File.mkdir_p!(Path.dirname(path))
-    File.write!(path, os_pid())
-    :ok
-  end
-
-  defp release_project_lock(nil), do: :ok
-
-  defp release_project_lock(path) do
-    case File.read(path) do
-      {:ok, body} ->
-        case Integer.parse(String.trim(body)) do
-          {pid, ""} ->
-            if pid == os_pid_int() do
-              File.rm(path)
-              :ok
-            else
-              :ok
-            end
-
-          _ ->
-            :ok
-        end
-
-      _ ->
-        :ok
-    end
-  end
-
-  defp force_release_project_lock(nil), do: :ok
-
-  defp force_release_project_lock(path) do
-    File.rm(path)
-    :ok
-  end
-
-  defp pid_alive?(pid) when is_integer(pid) and pid > 0 do
-    case System.cmd("bash", ["--noprofile", "--norc", "-c", "kill -0 #{pid} 2>/dev/null"]) do
-      {_out, 0} -> true
-      _ -> false
-    end
-  end
-
-  defp os_pid do
-    :os.getpid() |> List.to_string()
-  end
-
-  defp os_pid_int do
-    os_pid()
-    |> Integer.parse()
-    |> case do
-      {pid, ""} -> pid
-      _ -> -1
-    end
-  end
 end
