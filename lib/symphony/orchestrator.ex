@@ -4,7 +4,16 @@ defmodule Symphony.Orchestrator do
   use GenServer
   require Logger
 
-  alias Symphony.{Workflow, Config, Tracker, WorkspaceManager, Issue, GitReview, PlanContract}
+  alias Symphony.{
+    Workflow,
+    Config,
+    Tracker,
+    WorkspaceManager,
+    Issue,
+    GitReview,
+    PlanContract,
+    OrchestratorDecision
+  }
 
   @heartbeat_interval_ms 5_000
   @handoff_pending_ttl_ms 30_000
@@ -260,55 +269,20 @@ defmodule Symphony.Orchestrator do
         state =
           case result do
             {:ok, _payload} ->
-              if state.config.review_required do
-                case Tracker.mark_in_review(state.config, issue_id) do
-                  :ok ->
-                    log_event(state, "tracker_marked_in_review", entry.issue_identifier, %{
-                      issue_id: issue_id
-                    })
-
-                  {:error, {:rate_limited, reset_ms}} ->
-                    state
-                    |> pause_for_rate_limit(reset_ms, "mark_in_review")
-                    |> schedule_retry(issue_id, entry.issue_identifier, 1, "tracker_rate_limited")
-
-                  {:error, reason} ->
-                    Logger.warning(
-                      "failed to mark issue #{entry.issue_identifier} in review: #{inspect(reason)}"
-                    )
-
-                    state
-                    |> log_event("tracker_mark_in_review_failed", entry.issue_identifier, %{
-                      issue_id: issue_id,
-                      reason: inspect(reason)
-                    })
-                    |> schedule_retry(issue_id, entry.issue_identifier, 1, "normal_completion")
+              tracker_result =
+                if state.config.review_required do
+                  Tracker.mark_in_review(state.config, issue_id)
+                else
+                  Tracker.mark_done(state.config, issue_id)
                 end
-              else
-                case Tracker.mark_done(state.config, issue_id) do
-                  :ok ->
-                    log_event(state, "tracker_marked_done", entry.issue_identifier, %{
-                      issue_id: issue_id
-                    })
 
-                  {:error, {:rate_limited, reset_ms}} ->
-                    state
-                    |> pause_for_rate_limit(reset_ms, "mark_done")
-                    |> schedule_retry(issue_id, entry.issue_identifier, 1, "tracker_rate_limited")
-
-                  {:error, reason} ->
-                    Logger.warning(
-                      "failed to mark issue #{entry.issue_identifier} done: #{inspect(reason)}"
-                    )
-
-                    state
-                    |> log_event("tracker_mark_done_failed", entry.issue_identifier, %{
-                      issue_id: issue_id,
-                      reason: inspect(reason)
-                    })
-                    |> schedule_retry(issue_id, entry.issue_identifier, 1, "normal_completion")
-                end
-              end
+              apply_run_success_follow_up(
+                state,
+                issue_id,
+                entry.issue_identifier,
+                state.config.review_required,
+                tracker_result
+              )
 
             {:error, payload} ->
               reason = error_reason(payload)
@@ -326,32 +300,7 @@ defmodule Symphony.Orchestrator do
                   reason: inspect(reason)
                 })
 
-              cond do
-                clarification_requested?(reason) ->
-                  next_state
-                  |> log_event("clarification_requested", entry.issue_identifier, %{
-                    issue_id: issue_id,
-                    attempt: attempt,
-                    reason: inspect(reason)
-                  })
-
-                non_retryable_failure?(reason) ->
-                  next_state
-                  |> log_event("run_failed_non_retryable", entry.issue_identifier, %{
-                    issue_id: issue_id,
-                    attempt: attempt,
-                    reason: inspect(reason)
-                  })
-
-                reset_ms = rate_limit_reset_ms(reason) ->
-                  next_state
-                  |> pause_for_rate_limit(reset_ms, "agent_run_failed")
-                  |> schedule_retry(issue_id, entry.issue_identifier, attempt + 1, "tracker_rate_limited")
-
-                true ->
-                  next_state
-                  |> schedule_retry(issue_id, entry.issue_identifier, attempt + 1, inspect(reason))
-              end
+              apply_run_error_follow_up(next_state, issue_id, entry.issue_identifier, reason, attempt)
           end
 
         {:noreply, state}
@@ -1949,14 +1898,46 @@ defmodule Symphony.Orchestrator do
     |> Enum.find_value(fn entry -> if entry.issue_identifier == issue_identifier, do: entry.issue.id end)
   end
 
-  defp clarification_requested?({:clarification_requested, _}), do: true
-  defp clarification_requested?(_), do: false
+  defp apply_run_success_follow_up(state, issue_id, issue_identifier, review_required, tracker_result) do
+    case OrchestratorDecision.follow_up_for_success(review_required, tracker_result) do
+      {:log_only, event_type} ->
+        log_event(state, event_type, issue_identifier, %{issue_id: issue_id})
 
-  defp non_retryable_failure?({:demo_plan_invalid, _}), do: true
-  defp non_retryable_failure?({:recording_capture_failed, _}), do: true
-  defp non_retryable_failure?({:recording_setup_failed, _}), do: true
-  defp non_retryable_failure?(:recording_setup_command_missing), do: true
-  defp non_retryable_failure?(_), do: false
+      {:pause_and_retry, reset_ms, attempt, error} ->
+        context = if review_required, do: "mark_in_review", else: "mark_done"
+
+        state
+        |> pause_for_rate_limit(reset_ms, context)
+        |> schedule_retry(issue_id, issue_identifier, attempt, error)
+
+      {:log_and_retry, event_type, reason_text, attempt, error} ->
+        target = if review_required, do: "in review", else: "done"
+        Logger.warning("failed to mark issue #{issue_identifier} #{target}: #{reason_text}")
+
+        state
+        |> log_event(event_type, issue_identifier, %{issue_id: issue_id, reason: reason_text})
+        |> schedule_retry(issue_id, issue_identifier, attempt, error)
+    end
+  end
+
+  defp apply_run_error_follow_up(state, issue_id, issue_identifier, reason, attempt) do
+    case OrchestratorDecision.follow_up_for_error(reason, attempt) do
+      {:log_only, event_type, reason_text, event_attempt} ->
+        log_event(state, event_type, issue_identifier, %{
+          issue_id: issue_id,
+          attempt: event_attempt,
+          reason: reason_text
+        })
+
+      {:pause_and_retry, reset_ms, next_attempt, error} ->
+        state
+        |> pause_for_rate_limit(reset_ms, "agent_run_failed")
+        |> schedule_retry(issue_id, issue_identifier, next_attempt, error)
+
+      {:retry, next_attempt, error} ->
+        schedule_retry(state, issue_id, issue_identifier, next_attempt, error)
+    end
+  end
 
   defp github_repo_slug_from_config(config) do
     config.github_webhook_repo || parse_repo_slug(System.get_env("GITHUB_REPO_URL"))

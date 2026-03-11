@@ -143,20 +143,205 @@ defmodule Symphony.OrchestratorTest do
     assert {:error, :issue_not_running} = Symphony.Orchestrator.cancel_issue("TEST-404")
   end
 
-  defp running_entry(identifier) do
+  test "agent_run_result success marks done and records a recent run", %{
+    orchestrator: orchestrator,
+    original: original
+  } do
+    issue = running_issue("issue-1", "TEST-1")
+
+    :sys.replace_state(orchestrator, fn _ ->
+      %{
+        original
+        | config: orchestrator_config(false),
+          running: %{"issue-1" => running_entry(issue)},
+          claimed: MapSet.new(["issue-1"]),
+          recent_runs: [],
+          completed: MapSet.new()
+      }
+    end)
+
+    send(orchestrator, {:agent_run_result, "issue-1", {:ok, %{artifacts: [%{kind: "demo"}]}}})
+
+    state = wait_for_state(orchestrator, fn state -> state.running == %{} end)
+    assert MapSet.member?(state.completed, "issue-1")
+    assert hd(state.recent_runs).outcome == "completed"
+    assert hd(state.recent_runs).artifacts == [%{kind: "demo"}]
+    assert Enum.any?(state.events, &(&1.type == "tracker_marked_done"))
+  end
+
+  test "agent_run_result clarification failures stop without retrying", %{
+    orchestrator: orchestrator,
+    original: original
+  } do
+    issue = running_issue("issue-1", "TEST-1")
+
+    :sys.replace_state(orchestrator, fn _ ->
+      %{
+        original
+        | config: orchestrator_config(true),
+          running: %{"issue-1" => running_entry(issue)},
+          claimed: MapSet.new(["issue-1"]),
+          retry_attempts: %{},
+          recent_runs: []
+      }
+    end)
+
+    send(
+      orchestrator,
+      {:agent_run_result, "issue-1",
+       {:error, %{reason: {:clarification_requested, %{status: "blocked"}}, artifacts: []}}}
+    )
+
+    state = wait_for_state(orchestrator, fn state -> state.running == %{} end)
+    assert state.retry_attempts == %{}
+    assert hd(state.recent_runs).outcome == "failed"
+    assert Enum.any?(state.events, &(&1.type == "clarification_requested"))
+  end
+
+  test "agent_run_result rate limits pause and schedule a retry", %{
+    orchestrator: orchestrator,
+    original: original
+  } do
+    issue = running_issue("issue-1", "TEST-1")
+
+    :sys.replace_state(orchestrator, fn _ ->
+      %{
+        original
+        | running: %{"issue-1" => running_entry(issue)},
+          claimed: MapSet.new(["issue-1"]),
+          retry_attempts: %{},
+          recent_runs: []
+      }
+    end)
+
+    send(
+      orchestrator,
+      {:agent_run_result, "issue-1",
+       {:error, %{reason: {:rate_limited, 123_456}, artifacts: []}}}
+    )
+
+    state = wait_for_state(orchestrator, fn state -> map_size(state.retry_attempts) == 1 end)
+    assert state.paused == true
+    assert state.paused_reason == "linear_rate_limit"
+    assert Map.has_key?(state.retry_attempts, "issue-1")
+    assert Enum.any?(state.events, &(&1.type == "run_failed"))
+  end
+
+  test "agent runtime events update the running phase and log elapsed details", %{
+    orchestrator: orchestrator,
+    original: original
+  } do
+    issue = running_issue("issue-1", "TEST-1")
+
+    entry =
+      issue
+      |> running_entry()
+      |> Map.put(:phase, "workspace_setup")
+      |> Map.put(:phase_started_at_ms, System.monotonic_time(:millisecond) - 25)
+
+    :sys.replace_state(orchestrator, fn _ ->
+      %{original | running: %{"issue-1" => entry}, events: []}
+    end)
+
+    send(orchestrator, {:agent_runtime_event, "issue-1", "workspace_setup_finished", %{}})
+
+    state =
+      wait_for_state(orchestrator, fn state ->
+        state.running["issue-1"].phase == "planning"
+      end)
+
+    assert state.running["issue-1"].last_update_type == "workspace_setup_finished"
+    assert Enum.any?(state.events, fn event ->
+             event.type == "workspace_setup_finished" and
+               is_integer(event.details["elapsed_ms"])
+           end)
+  end
+
+  test "worker crash schedules a retry and normal down just clears running state", %{
+    orchestrator: orchestrator,
+    original: original
+  } do
+    issue = running_issue("issue-1", "TEST-1")
+    crash_ref = make_ref()
+
+    :sys.replace_state(orchestrator, fn _ ->
+      %{
+        original
+        | config: orchestrator_config(false),
+          running: %{
+            "issue-1" =>
+              running_entry(issue)
+              |> Map.put(:pid, self())
+              |> Map.put(:monitor_ref, crash_ref)
+          },
+          retry_attempts: %{}
+      }
+    end)
+
+    send(orchestrator, {:DOWN, crash_ref, :process, self(), :killed})
+
+    state = wait_for_state(orchestrator, fn state -> map_size(state.retry_attempts) == 1 end)
+    assert state.running == %{}
+    assert Map.has_key?(state.retry_attempts, "issue-1")
+    assert Enum.any?(state.events, &(&1.type == "worker_crashed"))
+
+    normal_ref = make_ref()
+
+    :sys.replace_state(orchestrator, fn current ->
+      %{
+        current
+        | running: %{
+            "issue-2" =>
+              running_entry(running_issue("issue-2", "TEST-2"))
+              |> Map.put(:pid, self())
+              |> Map.put(:monitor_ref, normal_ref)
+          }
+      }
+    end)
+
+    send(orchestrator, {:DOWN, normal_ref, :process, self(), :normal})
+
+    final_state =
+      wait_for_state(orchestrator, fn state -> not Map.has_key?(state.running, "issue-2") end)
+
+    refute Map.has_key?(final_state.retry_attempts, "issue-2")
+  end
+
+  test "heartbeat resumes expired rate-limit pauses", %{
+    orchestrator: orchestrator,
+    original: original
+  } do
+    :sys.replace_state(orchestrator, fn _ ->
+      %{
+        original
+        | paused: true,
+          paused_reason: "linear_rate_limit",
+          paused_until_ms: System.system_time(:millisecond) - 1_000,
+          events: []
+      }
+    end)
+
+    send(orchestrator, :heartbeat)
+
+    state = wait_for_state(orchestrator, fn state -> state.paused == false end)
+    assert state.paused_reason == nil
+    assert state.paused_until_ms == nil
+    assert Enum.any?(state.events, &(&1.type == "scheduler_resumed"))
+  end
+
+  defp running_entry(identifier) when is_binary(identifier) do
+    running_entry(running_issue("issue-1", identifier))
+  end
+
+  defp running_entry(%Symphony.Issue{} = issue) do
     %{
-      issue: %Symphony.Issue{
-        id: "issue-1",
-        identifier: identifier,
-        title: "Issue #{identifier}",
-        url: "https://linear.example/#{identifier}",
-        state: "In Progress"
-      },
-      issue_identifier: identifier,
+      issue: issue,
+      issue_identifier: issue.identifier,
       started_at: 1,
       retry_attempt: 0,
-      workspace_path: "/tmp/#{identifier}",
+      workspace_path: "/tmp/#{issue.identifier}",
       routing: %{provider: "zai", model: "GLM-5"},
+      pid: self(),
       session_id: "session-1",
       thread_id: "thread-1",
       turn_id: "turn-1",
@@ -165,6 +350,41 @@ defmodule Symphony.OrchestratorTest do
       last_codex_timestamp: 2
     }
   end
+
+  defp running_issue(id, identifier) do
+    %Symphony.Issue{
+      id: id,
+      identifier: identifier,
+      title: "Issue #{identifier}",
+      url: "https://linear.example/#{identifier}",
+      state: "In Progress"
+    }
+  end
+
+  defp orchestrator_config(review_required) do
+    %Symphony.Config{
+      tracker_kind: "mock",
+      review_required: review_required,
+      max_retry_backoff_ms: 60_000,
+      hooks_timeout_ms: 100,
+      workspace_root: System.tmp_dir!()
+    }
+  end
+
+  defp wait_for_state(orchestrator, predicate, attempts \\ 20)
+
+  defp wait_for_state(orchestrator, predicate, attempts) when attempts > 0 do
+    state = :sys.get_state(orchestrator)
+
+    if predicate.(state) do
+      state
+    else
+      Process.sleep(25)
+      wait_for_state(orchestrator, predicate, attempts - 1)
+    end
+  end
+
+  defp wait_for_state(orchestrator, _predicate, 0), do: :sys.get_state(orchestrator)
 
   defp retry_entry(identifier) do
     %{issue_id: "issue-2", identifier: identifier, attempt: 2, due_at_ms: 999, error: "boom"}
