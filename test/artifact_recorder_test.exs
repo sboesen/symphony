@@ -91,6 +91,63 @@ defmodule Symphony.ArtifactRecorderTest do
     assert artifact.verification == %{"ok" => true}
   end
 
+  test "returns no artifacts when recording is disabled", %{workspace: workspace} do
+    config = %Symphony.Config{recording_enabled: false, recording_url: "demo.html"}
+    issue = %Symphony.Issue{identifier: "TEST-1", title: "Artifact"}
+
+    assert {:ok, []} = ArtifactRecorder.capture(issue, 1, workspace, config)
+  end
+
+  test "returns no artifacts when recording url is missing", %{workspace: workspace} do
+    config = %Symphony.Config{recording_enabled: true, recording_url: nil}
+    issue = %Symphony.Issue{identifier: "TEST-1", title: "Artifact"}
+
+    assert {:ok, []} = ArtifactRecorder.capture(issue, 1, workspace, config)
+  end
+
+  test "requires a setup command for local http targets", %{workspace: workspace} do
+    config = %Symphony.Config{
+      recording_enabled: true,
+      recording_url: "http://127.0.0.1:4567",
+      recording_ready_timeout_ms: 1_000,
+      recording_wait_ms: 0,
+      recording_width: 1280,
+      recording_height: 720,
+      recording_trace: false,
+      hooks_timeout_ms: 1_000
+    }
+
+    issue = %Symphony.Issue{identifier: "TEST-1", title: "Artifact"}
+
+    assert {:error, :recording_setup_command_missing, []} =
+             ArtifactRecorder.capture(issue, 1, workspace, config)
+  end
+
+  test "returns output dir errors when configured output base is invalid", %{
+    workspace: workspace,
+    html_path: html_path
+  } do
+    invalid_base = Path.join(workspace, "not-a-directory")
+    File.write!(invalid_base, "file")
+
+    config = %Symphony.Config{
+      recording_enabled: true,
+      recording_url: html_path,
+      recording_output_dir: invalid_base,
+      recording_ready_timeout_ms: 1_000,
+      recording_wait_ms: 0,
+      recording_width: 1280,
+      recording_height: 720,
+      recording_trace: false,
+      hooks_timeout_ms: 1_000
+    }
+
+    issue = %Symphony.Issue{identifier: "TEST-1", title: "Artifact"}
+
+    assert {:error, {:recording_output_dir_failed, _reason}} =
+             ArtifactRecorder.capture(issue, 1, workspace, config)
+  end
+
   test "returns failed artifact when manifest is malformed", %{
     workspace: workspace,
     html_path: html_path
@@ -115,5 +172,32 @@ defmodule Symphony.ArtifactRecorderTest do
 
     assert artifact.kind == "demo_artifact"
     assert artifact.status == "error"
+  end
+
+  test "returns failed artifact when capture command exits nonzero without a manifest", %{
+    workspace: workspace,
+    html_path: html_path
+  } do
+    System.put_env("FAKE_NODE_MODE", "fail")
+
+    config = %Symphony.Config{
+      recording_enabled: true,
+      recording_url: html_path,
+      recording_ready_timeout_ms: 1_000,
+      recording_wait_ms: 0,
+      recording_width: 1280,
+      recording_height: 720,
+      recording_trace: false,
+      hooks_timeout_ms: 1_000
+    }
+
+    issue = %Symphony.Issue{identifier: "TEST-1", title: "Artifact"}
+
+    assert {:error, {:recording_capture_failed, {:recording_command_failed, 1, ""}}, [artifact]} =
+             ArtifactRecorder.capture(issue, 1, workspace, config)
+
+    assert artifact.kind == "demo_artifact"
+    assert artifact.status == "error"
+    assert artifact.error =~ "recording_command_failed"
   end
 end

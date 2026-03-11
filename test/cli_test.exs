@@ -1,6 +1,28 @@
 defmodule Symphony.CLITest do
   use ExUnit.Case, async: false
 
+  defp run_cli(args, extra_env \\ []) do
+    env =
+      [
+        {"MIX_ENV", "test"},
+        {"CLI_ARGS_JSON", Jason.encode!(args)}
+        | extra_env
+      ]
+
+    System.cmd(
+      "mix",
+      [
+        "run",
+        "--no-start",
+        "-e",
+        "Symphony.CLI.main(Jason.decode!(System.fetch_env!(\"CLI_ARGS_JSON\")))"
+      ],
+      cd: File.cwd!(),
+      env: env,
+      stderr_to_stdout: true
+    )
+  end
+
   test "parses runtime args from flags and positional workflow" do
     parsed =
       Symphony.CLI.parse_runtime_args([
@@ -158,5 +180,88 @@ defmodule Symphony.CLITest do
     assert :ok = Symphony.CLI.cleanup_runtime_file(runtime_path, workflow_path)
     refute File.exists?(runtime_path)
     refute File.exists?(lock_path)
+  end
+
+  test "parse_runtime_args honors help alias and falls back to default workflow" do
+    parsed = Symphony.CLI.parse_runtime_args(["-h"])
+
+    assert parsed.help? == true
+    assert parsed.workflow_path == "./WORKFLOW.md"
+    assert parsed.project_slug == nil
+    assert parsed.repo_url == nil
+    assert parsed.port == nil
+  end
+
+  test "cleanup_runtime_file removes malformed runtime files even when workflow loading fails" do
+    runtime_path =
+      Path.join(System.tmp_dir!(), "symphony-runtime-#{System.unique_integer([:positive])}.json")
+
+    workflow_path =
+      Path.join(System.tmp_dir!(), "symphony-workflow-#{System.unique_integer([:positive])}.md")
+
+    File.write!(runtime_path, "{")
+    File.write!(workflow_path, "not: [valid")
+
+    on_exit(fn ->
+      File.rm(runtime_path)
+      File.rm(workflow_path)
+    end)
+
+    assert :ok = Symphony.CLI.cleanup_runtime_file(runtime_path, workflow_path)
+    refute File.exists?(runtime_path)
+  end
+
+  test "cleanup_runtime_file ignores missing runtime files" do
+    runtime_path =
+      Path.join(System.tmp_dir!(), "symphony-runtime-#{System.unique_integer([:positive])}.json")
+
+    assert :ok = Symphony.CLI.cleanup_runtime_file(runtime_path)
+    refute File.exists?(runtime_path)
+  end
+
+  test "main prints help and exits successfully" do
+    {output, 0} = run_cli(["--help"])
+
+    assert output =~ "Runs the Symphony orchestrator."
+    assert output =~ "--project-slug SLUG"
+  end
+
+  test "main exits when the workflow file is missing" do
+    missing_path =
+      Path.join(System.tmp_dir!(), "missing-workflow-#{System.unique_integer([:positive])}.md")
+
+    {output, 2} = run_cli(["--workflow", missing_path])
+
+    assert output =~ "workflow file not found: #{missing_path}"
+  end
+
+  test "main exits when another instance already holds the project lock" do
+    runtime_path =
+      Path.join(System.tmp_dir!(), "symphony-runtime-#{System.unique_integer([:positive])}.json")
+
+    project_slug = "locked-project-#{System.unique_integer([:positive])}"
+    lock_path = Path.join(System.tmp_dir!(), "symphony-project-#{project_slug}.lock")
+    workflow_path = Path.expand("test/support/WORKFLOW.test.md", File.cwd!())
+
+    File.write!(lock_path, :os.getpid() |> List.to_string())
+
+    on_exit(fn ->
+      File.rm(runtime_path)
+      File.rm(lock_path)
+    end)
+
+    {output, 1} =
+      run_cli(
+        ["--workflow", workflow_path, "--project-slug", project_slug],
+        [{"SYMPHONY_RUNTIME_FILE", runtime_path}]
+      )
+
+    assert output =~ "another Symphony instance is already running for project #{project_slug}"
+    assert File.exists?(runtime_path)
+
+    assert {:ok, body} = File.read(runtime_path)
+    assert {:ok, runtime} = Jason.decode(body)
+    assert runtime["workflow_path"] == workflow_path
+    assert runtime["project_slug"] == project_slug
   end
 end

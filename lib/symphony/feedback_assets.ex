@@ -53,10 +53,14 @@ defmodule Symphony.FeedbackAssets do
   end
 
   defp extract_urls(text) when is_binary(text) do
-    @linear_upload_re
+    linear_upload_regex()
     |> Regex.scan(text)
     |> List.flatten()
     |> Enum.map(&String.trim_trailing(&1, ".,"))
+  end
+
+  defp linear_upload_regex do
+    Application.get_env(:symphony, :linear_upload_regex, @linear_upload_re)
   end
 
   defp excerpt(text) when is_binary(text) do

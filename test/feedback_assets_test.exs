@@ -14,6 +14,7 @@ defmodule Symphony.FeedbackAssetsTest do
 
     on_exit(fn ->
       Plug.Cowboy.shutdown(ref)
+      Application.delete_env(:symphony, :linear_upload_regex)
     end)
 
     %{base_url: "http://127.0.0.1:#{port}"}
@@ -58,7 +59,45 @@ defmodule Symphony.FeedbackAssetsTest do
     assert updated.feedback_assets_text == ""
   end
 
+  test "sync downloads supported feedback assets into the workspace", %{base_url: base_url} do
+    Application.put_env(
+      :symphony,
+      :linear_upload_regex,
+      ~r{#{Regex.escape(base_url)}/[^\s<>)\]]+}
+    )
+
+    workspace =
+      Path.join(System.tmp_dir!(), "feedback-assets-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf!(workspace) end)
+
+    issue = %Issue{
+      identifier: "SBO-1",
+      description: "See screenshot #{base_url}/image.png",
+      comments: [%{body: "Another #{base_url}/image.jpg"}]
+    }
+
+    config = %Symphony.Config{tracker_api_key: "linear-key"}
+
+    updated = FeedbackAssets.sync(issue, config, workspace)
+
+    assert length(updated.feedback_assets) == 2
+    assert Enum.all?(updated.feedback_assets, &File.exists?(&1.path))
+    assert Enum.any?(updated.feedback_assets, &String.ends_with?(&1.relative_path, ".png"))
+    assert Enum.any?(updated.feedback_assets, &String.ends_with?(&1.relative_path, ".jpg"))
+    assert updated.feedback_assets_text =~ "Screenshot feedback files downloaded into the workspace:"
+    assert updated.feedback_assets_text =~ "from description"
+    assert updated.feedback_assets_text =~ "from comment"
+  end
+
   test "sync skips downloads when the api key is missing", %{base_url: base_url} do
+    Application.put_env(
+      :symphony,
+      :linear_upload_regex,
+      ~r{#{Regex.escape(base_url)}/[^\s<>)\]]+}
+    )
+
     workspace =
       Path.join(System.tmp_dir!(), "feedback-assets-#{System.unique_integer([:positive])}")
 

@@ -7,6 +7,7 @@ defmodule Symphony.AgentRunner do
   alias Symphony.{
     ArtifactRecorder,
     CompletionResult,
+    AgentRunnerDecision,
     CodexRouter,
     DemoPlan,
     FeedbackAssets,
@@ -1219,11 +1220,6 @@ defmodule Symphony.AgentRunner do
     end
   end
 
-  defp active_state?(issue, active_states) do
-    normalized = Symphony.Issue.normalize_state(issue.state)
-    normalized in active_states
-  end
-
   defp next_turn_action(
          %{status: "completed"},
          _issue,
@@ -1233,11 +1229,9 @@ defmodule Symphony.AgentRunner do
          workspace_path,
          _workspace_snapshot
        ) do
-    ensure_plan_ready_for_handoff(workspace_path)
-    |> case do
-      :ok -> :stop
-      {:error, reason} -> {:error, reason}
-    end
+    AgentRunnerDecision.next_turn_action(%{status: "completed"}, %{
+      plan_ready: ensure_plan_ready_for_handoff(workspace_path)
+    })
   end
 
   defp next_turn_action(
@@ -1249,7 +1243,7 @@ defmodule Symphony.AgentRunner do
          _workspace_path,
          _workspace_snapshot
        ),
-       do: {:error, {:blocked, completion}}
+       do: AgentRunnerDecision.next_turn_action(completion, %{})
 
   defp next_turn_action(
          %{status: "needs_more_work"} = completion,
@@ -1260,19 +1254,13 @@ defmodule Symphony.AgentRunner do
          workspace_path,
          workspace_snapshot
        ) do
-    cond do
-      turn_index >= max_turns ->
-        {:error, {:max_turns_exceeded, completion}}
-
-      not active_state?(issue, config.tracker_active_states) ->
-        {:error, {:needs_more_work_but_issue_not_active, completion}}
-
-      WorkspaceSnapshot.progress_made?(workspace_path, workspace_snapshot) ->
-        :continue
-
-      true ->
-        {:error, {:needs_more_work_without_progress, completion}}
-    end
+    AgentRunnerDecision.next_turn_action(completion, %{
+      turn_index: turn_index,
+      max_turns: max_turns,
+      issue_state: issue.state,
+      active_states: config.tracker_active_states,
+      progress_made?: WorkspaceSnapshot.progress_made?(workspace_path, workspace_snapshot)
+    })
   end
 
   defp resolve_completion_result(%{completion: completion}, _workspace_path) when is_map(completion) do
@@ -1370,24 +1358,12 @@ defmodule Symphony.AgentRunner do
   end
 
   defp salvage_result(workspace_path, reason) do
-    if reason in [:stall_timeout, :turn_timeout] do
-      case CompletionResult.load(workspace_path) do
-        {:ok, completion} ->
-          {:ok, %{status: completion.status, completion: completion}}
-
-        {:error, :missing} ->
-          if demo_plan_exists?(workspace_path) or branch_has_committed_changes?(workspace_path) do
-            {:ok, %{status: "completed", completion: nil, salvaged: true}}
-          else
-            :no_salvage
-          end
-
-        _ ->
-          :no_salvage
-      end
-    else
-      :no_salvage
-    end
+    AgentRunnerDecision.salvage_timeout_result(
+      reason,
+      CompletionResult.load(workspace_path),
+      demo_plan_exists?(workspace_path),
+      branch_has_committed_changes?(workspace_path)
+    )
   end
 
   defp demo_plan_exists?(workspace_path) do
