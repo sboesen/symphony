@@ -4,6 +4,8 @@ defmodule Symphony.GitHubWebhookManager do
   use GenServer
   require Logger
 
+  alias Symphony.GitHubWebhookReconciler
+
   @default_poll_ms 5_000
   @ngrok_api "http://127.0.0.1:4040/api/tunnels"
 
@@ -182,15 +184,19 @@ defmodule Symphony.GitHubWebhookManager do
       secret = config.github_webhook_secret
       callback = callback_url(public_url)
 
-      repos =
-        broker_sessions()
-        |> List.wrap()
-        |> Enum.map(&(&1.repo || &1["repo"]))
-        |> Enum.filter(&(is_binary(&1) and &1 != ""))
-        |> Enum.uniq()
+      repos = GitHubWebhookReconciler.desired_github_repos(broker_sessions())
 
       with {:ok, next_hooks} <-
-             reconcile_desired_github_hooks(state.github_webhooks, repos, secret, callback) do
+             GitHubWebhookReconciler.reconcile_desired_github_hooks(
+               state.github_webhooks,
+               repos,
+               secret,
+               callback,
+               cleanup_github_webhook: &cleanup_github_webhook/1,
+               cleanup_old_symphony_github_hooks: &cleanup_old_symphony_github_hooks/1,
+               create_github_webhook: &create_github_webhook/3,
+               log_info: &Logger.info/1
+             ) do
         {:ok, %{state | github_webhooks: next_hooks}}
       end
     else
@@ -203,28 +209,20 @@ defmodule Symphony.GitHubWebhookManager do
     if config.linear_webhook_auto_register do
       secret = config.linear_webhook_secret
 
-      desired_projects =
-        broker_sessions()
-        |> List.wrap()
-        |> Enum.map(fn session ->
-          %{
-            project_slug: Map.get(session, :project_slug) || Map.get(session, "project_slug"),
-            session_id: Map.get(session, :session_id) || Map.get(session, "session_id")
-          }
-        end)
-        |> Enum.filter(fn session ->
-          is_binary(session.project_slug) and session.project_slug != "" and
-            is_binary(session.session_id) and session.session_id != ""
-        end)
-        |> Enum.uniq_by(& &1.project_slug)
+      desired_projects = GitHubWebhookReconciler.desired_linear_projects(broker_sessions())
 
       with {:ok, next_hooks} <-
-             reconcile_desired_linear_hooks(
+             GitHubWebhookReconciler.reconcile_desired_linear_hooks(
                state.linear_webhooks,
                desired_projects,
                secret,
                public_url,
-               config
+               config,
+               cleanup_linear_webhook: &cleanup_linear_webhook/2,
+               cleanup_old_symphony_linear_hooks: &cleanup_old_symphony_linear_hooks/2,
+               create_linear_webhook: &create_linear_webhook/4,
+               linear_callback_url: &GitHubWebhookReconciler.linear_callback_url/2,
+               log_info: &Logger.info/1
              ) do
         {:ok, %{state | linear_webhooks: next_hooks}}
       end
@@ -232,78 +230,6 @@ defmodule Symphony.GitHubWebhookManager do
       _ = Enum.each(state.linear_webhooks, fn {_slug, hook} -> cleanup_linear_webhook(config, hook) end)
       {:ok, %{state | linear_webhooks: %{}}}
     end
-  end
-
-  defp reconcile_desired_github_hooks(current_hooks, repos, secret, callback) do
-    next_hooks =
-      Enum.reduce(Map.keys(current_hooks), current_hooks, fn repo, acc ->
-        if repo in repos do
-          acc
-        else
-          _ = cleanup_github_webhook(Map.get(acc, repo))
-          Map.delete(acc, repo)
-        end
-      end)
-
-    Enum.reduce_while(repos, {:ok, next_hooks}, fn repo, {:ok, acc} ->
-      hook = Map.get(acc, repo)
-
-      if hook && hook[:callback] == callback do
-        {:cont, {:ok, acc}}
-      else
-        _ = cleanup_github_webhook(hook)
-        _ = cleanup_old_symphony_github_hooks(repo)
-
-        case create_github_webhook(repo, secret, callback) do
-          {:ok, hook_id} ->
-            Logger.info("registered GitHub webhook for #{repo} -> #{callback}")
-            {:cont, {:ok, Map.put(acc, repo, %{id: hook_id, repo: repo, callback: callback})}}
-
-          error ->
-            {:halt, error}
-        end
-      end
-    end)
-  end
-
-  defp reconcile_desired_linear_hooks(current_hooks, desired_projects, secret, public_url, config) do
-    next_hooks =
-      Enum.reduce(Map.keys(current_hooks), current_hooks, fn slug, acc ->
-        if Enum.any?(desired_projects, &(&1.project_slug == slug)) do
-          acc
-        else
-          _ = cleanup_linear_webhook(config, Map.get(acc, slug))
-          Map.delete(acc, slug)
-        end
-      end)
-
-    Enum.reduce_while(desired_projects, {:ok, next_hooks}, fn project, {:ok, acc} ->
-      callback = linear_callback_url(public_url, project.project_slug)
-      hook = Map.get(acc, project.project_slug)
-
-      if hook && hook[:callback] == callback do
-        {:cont, {:ok, acc}}
-      else
-        _ = cleanup_linear_webhook(config, hook)
-        _ = cleanup_old_symphony_linear_hooks(config, project.project_slug)
-
-        case create_linear_webhook(config, project.project_slug, secret, callback) do
-          {:ok, webhook} ->
-            Logger.info("registered Linear webhook for #{project.project_slug} -> #{callback}")
-
-            {:cont,
-             {:ok,
-              Map.put(acc, project.project_slug, %{
-                id: webhook[:id],
-                project_slug: project.project_slug,
-                callback: callback
-              })}}
-
-          error ->
-            {:halt, error}
-        end
-      end
-    end)
   end
 
   defp create_github_webhook(repo, secret, callback) do
@@ -457,8 +383,7 @@ defmodule Symphony.GitHubWebhookManager do
 
   defp stop_ngrok(_), do: :ok
 
-  defp callback_url(public_url), do: public_url <> "/github/webhook"
-  defp linear_callback_url(public_url, project_slug), do: public_url <> "/linear/webhook/" <> project_slug
+  defp callback_url(public_url), do: GitHubWebhookReconciler.callback_url(public_url)
 
   defp current_config do
     try do
