@@ -68,6 +68,23 @@ function parseInteger(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function normalizeOptionalValue(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const normalized = `${value}`.trim();
+
+  if (
+    normalized === "" ||
+    ["null", "undefined", "false"].includes(normalized.toLowerCase())
+  ) {
+    return null;
+  }
+
+  return normalized;
+}
+
 async function ensureDir(dirPath) {
   await fs.mkdir(dirPath, { recursive: true });
 }
@@ -180,8 +197,8 @@ async function safeScreenshot(page, outputPath) {
 }
 
 async function waitForPageState(page, args) {
-  const waitForSelector = args["wait-for-selector"];
-  const waitForText = args["wait-for-text"];
+  const waitForSelector = normalizeOptionalValue(args["wait-for-selector"]);
+  const waitForText = normalizeOptionalValue(args["wait-for-text"]);
 
   if (waitForSelector) {
     await page.locator(waitForSelector).waitFor({ state: "visible", timeout: 15_000 });

@@ -347,21 +347,28 @@ defmodule Symphony.CodexExecRunner do
   end
 
   defp codex_args(base_args, model, config) do
-    base_args
-    |> ensure_contains("exec")
-    |> ensure_option("--json", nil)
-    |> ensure_option("--model", model)
-    |> ensure_option("--ask-for-approval", config_value(config, :approval_policy))
-    |> ensure_option("--sandbox", exec_sandbox(config))
+    exec_args =
+      []
+      |> ensure_flag("--json")
+      |> ensure_option("--model", model)
+
+    global_args =
+      if "--dangerously-bypass-approvals-and-sandbox" in base_args do
+        base_args
+      else
+        base_args
+        |> ensure_option("--ask-for-approval", config_value(config, :approval_policy))
+        |> ensure_option("--sandbox", exec_sandbox(config))
+      end
+
+    global_args ++ ["exec"] ++ exec_args
   end
 
-  defp ensure_contains(args, token) do
-    if token in args, do: args, else: [token | args]
-  end
-
-  defp ensure_option(args, key, nil) do
+  defp ensure_flag(args, key) do
     if key in args, do: args, else: args ++ [key]
   end
+
+  defp ensure_option(args, _key, nil), do: args
 
   defp ensure_option(args, key, value) do
     if key in args, do: args, else: args ++ [key, value]

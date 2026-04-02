@@ -145,11 +145,7 @@ defmodule Symphony.Broker do
     matched =
       state.sessions
       |> Map.values()
-      |> Enum.filter(fn session ->
-        is_binary(session.callback_url) and session.callback_url != "" and
-          (is_nil(repo) or is_nil(session.repo) or session.repo == repo) and
-          route_to_session?(session, issue_identifier)
-      end)
+      |> matching_github_sessions(repo, issue_identifier)
 
     results =
       Enum.map(matched, fn session ->
@@ -386,11 +382,34 @@ defmodule Symphony.Broker do
     end
   end
 
+  defp matching_github_sessions(sessions, repo, issue_identifier) do
+    candidates =
+      Enum.filter(sessions, fn session ->
+        is_binary(session.callback_url) and session.callback_url != "" and
+          route_to_session?(session, issue_identifier) and
+          repo_matches_session?(session, repo)
+      end)
+
+    case {repo, Enum.filter(candidates, &(&1.repo == repo))} do
+      {repo, exact_matches} when is_binary(repo) and repo != "" and exact_matches != [] ->
+        exact_matches
+
+      _ ->
+        candidates
+    end
+  end
+
   defp route_to_session?(_session, nil), do: true
 
   defp route_to_session?(session, issue_identifier) do
     issues = session.issue_identifiers || []
     issues == [] or issue_identifier in issues
+  end
+
+  defp repo_matches_session?(_session, nil), do: true
+
+  defp repo_matches_session?(session, repo) when is_binary(repo) do
+    is_nil(session.repo) or session.repo == repo
   end
 
   defp fallback_direct_result(matched, results, payload, headers, raw_body) do

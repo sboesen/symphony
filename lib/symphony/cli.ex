@@ -2,6 +2,7 @@ defmodule Symphony.CLI do
   @moduledoc false
 
   alias Symphony.Config
+  alias Symphony.CLICommand
   alias Symphony.CLIInteractive
   alias Symphony.CLIRuntime
   alias Symphony.GitHubRepo
@@ -57,64 +58,16 @@ defmodule Symphony.CLI do
   end
 
   def main(argv) do
-    parsed = parse_runtime_args(argv)
+    case CLICommand.run(parse_runtime_args(argv), CLICommand.deps()) do
+      {:halt, 0, :help} ->
+        print_help()
+        System.halt(0)
 
-    if parsed.help? do
-      print_help()
-      System.halt(0)
-    end
+      {:halt, code, message} when is_binary(message) ->
+        IO.puts(message)
+        System.halt(code)
 
-    workflow_path = parsed.workflow_path
-
-    unless File.exists?(workflow_path) do
-      IO.puts("workflow file not found: #{workflow_path}")
-      System.halt(2)
-    end
-
-    preflight_runtime_overrides(parsed)
-    prestart = ensure_prestart_services()
-
-    parsed =
-      case resolve_interactive_defaults(parsed, workflow_path) do
-        {:ok, resolved} ->
-          resolved
-
-        {:error, reason} ->
-          IO.puts("failed to resolve startup defaults: #{inspect(reason)}")
-          System.halt(2)
-      end
-
-    apply_runtime_overrides(parsed)
-    CLIRuntime.persist_runtime_context(parsed, workflow_path)
-    lock_file = CLIRuntime.project_lock_path(parsed.project_slug)
-
-    case CLIRuntime.acquire_project_lock(lock_file) do
-      :ok ->
-        :ok
-
-      {:error, {:already_running, pid}} ->
-        IO.puts(
-          "another Symphony instance is already running for project #{parsed.project_slug} (pid #{pid})"
-        )
-
-        System.halt(1)
-    end
-
-    case Process.whereis(Symphony.Supervisor) do
-      nil ->
-        stop_prestart_services(prestart)
-
-        case Symphony.Application.start(nil, workflow_path: workflow_path) do
-          {:ok, _pid} ->
-            Process.sleep(:infinity)
-
-          {:error, reason} ->
-            CLIRuntime.release_project_lock(lock_file)
-            IO.puts("failed to start: #{inspect(reason)}")
-            System.halt(1)
-        end
-
-      _pid ->
+      {:sleep_forever, _parsed} ->
         Process.sleep(:infinity)
     end
   end
@@ -186,14 +139,14 @@ defmodule Symphony.CLI do
     if trimmed == "", do: nil, else: trimmed
   end
 
-  defp preflight_runtime_overrides(%{} = parsed) do
+  def preflight_runtime_overrides(%{} = parsed) do
     if is_binary(parsed.linear_api_key), do: System.put_env("LINEAR_API_KEY", parsed.linear_api_key)
     if is_integer(parsed.port) and parsed.port > 0, do: System.put_env("SYMPHONY_SERVER_PORT", Integer.to_string(parsed.port))
     if parsed.no_review?, do: System.put_env("SYMPHONY_NO_REVIEW", "true"), else: System.delete_env("SYMPHONY_NO_REVIEW")
     :ok
   end
 
-  defp ensure_prestart_services do
+  def ensure_prestart_services do
     for app <- [:telemetry, :jason, :yaml_elixir, :finch, :plug_cowboy] do
       {:ok, _} = Application.ensure_all_started(app)
     end
@@ -211,7 +164,7 @@ defmodule Symphony.CLI do
     %{started_finch_pid: started_finch_pid}
   end
 
-  defp stop_prestart_services(%{started_finch_pid: pid}) when is_pid(pid) do
+  def stop_prestart_services(%{started_finch_pid: pid}) when is_pid(pid) do
     if Process.alive?(pid) do
       Process.unlink(pid)
       ref = Process.monitor(pid)
@@ -227,9 +180,9 @@ defmodule Symphony.CLI do
     :ok
   end
 
-  defp stop_prestart_services(_), do: :ok
+  def stop_prestart_services(_), do: :ok
 
-  defp resolve_interactive_defaults(parsed, workflow_path) do
+  def resolve_interactive_defaults(parsed, workflow_path) do
     with {:ok, workflow} <- Workflow.load(workflow_path),
          {:ok, config} <- Config.from_workflow(workflow) do
       CLIInteractive.resolve_defaults(parsed, config)

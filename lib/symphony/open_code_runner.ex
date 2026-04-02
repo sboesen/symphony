@@ -365,10 +365,10 @@ defmodule Symphony.OpenCodeRunner do
         normalized
 
       lower in ["glm-5", "glm5"] ->
-        "zai-coding-plan/glm-5"
+        "zai/glm-5"
 
       lower in ["glm-4.7", "glm47"] ->
-        "zai-coding-plan/glm-4.7"
+        "zai/glm-4.7"
 
       lower in ["codex-5-3", "gpt-5.3-codex"] ->
         "openai/gpt-5.3-codex"
@@ -380,7 +380,7 @@ defmodule Symphony.OpenCodeRunner do
         "openai/#{lower}"
 
       true ->
-        "zai-coding-plan/#{lower}"
+        "zai/#{lower}"
     end
   end
 
@@ -482,7 +482,7 @@ defmodule Symphony.OpenCodeRunner do
     end
   end
 
-  defp provider_id("zai", _), do: "zai-coding-plan"
+  defp provider_id("zai", _), do: "zai"
   defp provider_id("codex", _), do: "openai"
   defp provider_id(name, _) when is_binary(name), do: name
   defp provider_id(_, _), do: nil
