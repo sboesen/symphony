@@ -361,6 +361,11 @@ defmodule Symphony.OpenCodeRunner do
     lower = String.downcase(normalized)
 
     cond do
+      String.starts_with?(lower, "zai-coding-plan/") ->
+        normalized
+        |> String.replace_prefix("zai-coding-plan/", "zai/")
+        |> String.replace_prefix("ZAI-CODING-PLAN/", "zai/")
+
       String.contains?(normalized, "/") ->
         normalized
 

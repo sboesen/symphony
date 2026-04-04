@@ -67,4 +67,22 @@ defmodule Symphony.AgentRunnerPromptTest do
     assert demo_prompt =~ "http://127.0.0.1:4000"
     assert demo_prompt =~ "Repo demo context:"
   end
+
+  test "demo prompt explains when to choose screenshot versus video capture" do
+    root = Path.join(System.tmp_dir!(), "symphony-prompt-capture-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    prompt =
+      AgentRunnerPrompt.append_completion_prompt(
+        "base",
+        %{recording_enabled: true, recording_url: "http://127.0.0.1:3000"},
+        root
+      )
+
+    assert prompt =~ ~s(Choose `"capture": "video"` for motion or interaction)
+    assert prompt =~ ~s(Choose `"capture": "screenshot"` by default for static visual proof)
+    assert prompt =~ ~s(Only choose `"capture": "video"` when motion or interaction is actually necessary)
+  end
 end

@@ -30,13 +30,13 @@ codex:
       auth_mode: api_key
       api_key: $Z_API_KEY
       base_url: https://api.z.ai/api/coding/paas/v4
-      model: zai-coding-plan/glm-5
+      model: zai/glm-5
   router:
     enabled: true
     default_provider: codex
     hard_provider: codex
-    default_model: zai-coding-plan/glm-5
-    hard_model: zai-coding-plan/glm-5
+    default_model: zai/glm-5
+    hard_model: zai/glm-5
     hard_effort: xhigh
     hard_percentile: 95
 server:

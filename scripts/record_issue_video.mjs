@@ -205,11 +205,10 @@ async function waitForPageState(page, args) {
   }
 
   if (waitForText) {
-    await page.waitForFunction(
-      (needle) => document.body && document.body.innerText.includes(needle),
-      waitForText,
-      { timeout: 15_000 }
-    );
+    await page.getByText(waitForText, { exact: false }).first().waitFor({
+      state: "visible",
+      timeout: 15_000
+    });
   }
 }
 
