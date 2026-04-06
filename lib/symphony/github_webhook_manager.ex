@@ -237,7 +237,12 @@ defmodule Symphony.GitHubWebhookManager do
       Jason.encode!(%{
         name: "web",
         active: true,
-        events: ["pull_request", "pull_request_review"],
+        events: [
+          "pull_request",
+          "pull_request_review",
+          "issue_comment",
+          "pull_request_review_comment"
+        ],
         config: %{
           url: callback,
           content_type: "json",

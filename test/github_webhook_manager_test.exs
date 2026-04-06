@@ -178,6 +178,114 @@ defmodule Symphony.GitHubWebhookManagerTest do
     end
   end
 
+  test "ensure_ready registers github comment webhook events through ngrok" do
+    manager = Process.whereis(Symphony.GitHubWebhookManager)
+    orchestrator = Process.whereis(Symphony.Orchestrator)
+    broker = Process.whereis(Symphony.Broker)
+    original_manager = :sys.get_state(manager)
+    original_orchestrator = :sys.get_state(orchestrator)
+    original_broker = :sys.get_state(broker)
+
+    root = Path.join(System.tmp_dir!(), "symphony-ghwm-events-#{System.unique_integer([:positive])}")
+    bin_dir = Path.join(root, "bin")
+    File.mkdir_p!(bin_dir)
+
+    ngrok_path = Path.join(bin_dir, "ngrok")
+    gh_path = Path.join(bin_dir, "gh")
+    payload_log = Path.join(root, "gh_payload.json")
+    original_path = System.get_env("PATH") || ""
+    ref = make_ref()
+
+    File.write!(ngrok_path, "#!/bin/bash\nsleep 30\n")
+
+    File.write!(
+      gh_path,
+      """
+      #!/usr/bin/env python3
+      import json, pathlib, sys
+
+      args = sys.argv[1:]
+      payload_path = pathlib.Path("#{payload_log}")
+
+      if args[:4] == ["api", "--method", "POST", "repos/acme/repo/hooks"]:
+          input_idx = args.index("--input")
+          source = pathlib.Path(args[input_idx + 1])
+          payload_path.write_text(source.read_text())
+          print(json.dumps({"id": 123}), end="")
+      elif args[:2] == ["api", "repos/acme/repo/hooks"]:
+          print("[]", end="")
+      else:
+          print("{}", end="")
+      """
+    )
+
+    File.chmod!(ngrok_path, 0o755)
+    File.chmod!(gh_path, 0o755)
+    System.put_env("PATH", bin_dir <> ":" <> original_path)
+
+    case Plug.Cowboy.http(__MODULE__.NgrokRouter, [], ip: {127, 0, 0, 1}, port: 4040, ref: ref) do
+      {:ok, _pid} ->
+        on_exit(fn ->
+          current_state = :sys.get_state(manager)
+
+          if is_port(current_state.ngrok_port_handle) do
+            try do
+              Port.close(current_state.ngrok_port_handle)
+            rescue
+              _ -> :ok
+            end
+          end
+
+          :sys.replace_state(manager, fn _ -> original_manager end)
+          :sys.replace_state(orchestrator, fn _ -> original_orchestrator end)
+          :sys.replace_state(broker, fn _ -> original_broker end)
+          System.put_env("PATH", original_path)
+          Plug.Cowboy.shutdown(ref)
+          File.rm_rf!(root)
+        end)
+
+        :sys.replace_state(orchestrator, fn state ->
+          config =
+            %{state.config |
+              github_webhook_provider: "ngrok",
+              github_webhook_auto_register: true,
+              linear_webhook_auto_register: false,
+              github_webhook_secret: "secret"}
+
+          %{state | config: config}
+        end)
+
+        :sys.replace_state(broker, fn state ->
+          %{state |
+            owner: true,
+            session_id: "session-1",
+            sessions: %{
+              "session-1" => %{session_id: "session-1", repo: "acme/repo", project_slug: nil}
+            }}
+        end)
+
+        :sys.replace_state(manager, fn _ ->
+          %{original_manager | public_url: nil, github_webhooks: %{}, linear_webhooks: %{}, last_error: nil}
+        end)
+
+        send(manager, :ensure_ready)
+        _current =
+          wait_for_current(fn current ->
+            current.public_url == "https://example.ngrok.app" and
+              current.github_webhooks["acme/repo"] != nil
+          end)
+
+        payload = Jason.decode!(File.read!(payload_log))
+        assert Enum.sort(payload["events"]) ==
+                 Enum.sort(["pull_request", "pull_request_review", "issue_comment", "pull_request_review_comment"])
+
+      {:error, :eaddrinuse} ->
+        System.put_env("PATH", original_path)
+        File.rm_rf!(root)
+        assert true
+    end
+  end
+
   test "ensure_ready records ngrok installation failures" do
     manager = Process.whereis(Symphony.GitHubWebhookManager)
     orchestrator = Process.whereis(Symphony.Orchestrator)

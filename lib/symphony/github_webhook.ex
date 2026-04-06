@@ -156,8 +156,86 @@ defmodule Symphony.GitHubWebhook do
     end
   end
 
+  defp dispatch_event("issue_comment", payload, config) do
+    issue = payload["issue"] || %{}
+    comment = payload["comment"] || %{}
+    action = String.downcase(to_string(payload["action"] || ""))
+    identifier = extract_issue_identifier(issue)
+
+    cond do
+      not is_map(issue["pull_request"]) ->
+        {:ok, %{handled: false, reason: "not_pull_request_comment"}}
+
+      action not in ["created", "edited"] ->
+        {:ok, %{handled: false, issue_identifier: identifier, action: action}}
+
+      true ->
+        handle_feedback_event(config, identifier, "issue_comment", %{
+          action: action,
+          pr_url: issue["html_url"],
+          comment_url: comment["html_url"],
+          comment_body: comment["body"]
+        })
+    end
+  end
+
+  defp dispatch_event("pull_request_review_comment", payload, config) do
+    comment = payload["comment"] || %{}
+    pr = payload["pull_request"] || %{}
+    action = String.downcase(to_string(payload["action"] || ""))
+    identifier = extract_issue_identifier(pr)
+
+    if action in ["created", "edited"] do
+      handle_feedback_event(config, identifier, "pull_request_review_comment", %{
+        action: action,
+        pr_url: pr["html_url"],
+        comment_url: comment["html_url"],
+        comment_body: comment["body"]
+      })
+    else
+      {:ok, %{handled: false, issue_identifier: identifier, action: action}}
+    end
+  end
+
   defp dispatch_event(_event, _payload, _config),
     do: {:ok, %{handled: false, reason: "unsupported_event"}}
+
+  defp handle_feedback_event(_config, nil, event_type, details) do
+    {:ok, %{handled: false, reason: "issue_identifier_not_found", event: event_type, details: details}}
+  end
+
+  defp handle_feedback_event(config, identifier, event_type, details) do
+    with {:ok, issue} <- Tracker.fetch_issue_by_identifier(config, identifier),
+         true <- not is_nil(issue),
+         :ok <- Tracker.mark_started(config, issue.id),
+         :ok <- notify_feedback_retry(identifier, event_type, details) do
+      {:ok, %{handled: true, issue_identifier: identifier, transition: "in_progress", event: event_type}}
+    else
+      false ->
+        {:ok, %{handled: false, issue_identifier: identifier, reason: "issue_not_found", event: event_type}}
+
+      error ->
+        error
+    end
+  end
+
+  defp notify_feedback_retry(issue_identifier, event_type, details) do
+    Orchestrator.external_event(event_type, issue_identifier, details)
+
+    case Orchestrator.retry_issue(issue_identifier) do
+      {:ok, _payload} ->
+        :ok
+
+      {:error, :issue_not_found} ->
+        case Orchestrator.refresh() do
+          {:ok, _payload} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
   defp current_config do
     try do

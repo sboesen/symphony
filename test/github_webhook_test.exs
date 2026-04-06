@@ -187,6 +187,99 @@ defmodule Symphony.GitHubWebhookTest do
     assert_receive {:mark_in_review, "TEST-1"}
   end
 
+  test "moves pull request issue comments back to in progress and requests retry" do
+    Process.put(:symphony_tracker_test_pid, self())
+
+    on_exit(fn ->
+      Process.delete(:symphony_tracker_test_pid)
+    end)
+
+    payload = %{
+      "action" => "created",
+      "issue" => %{
+        "html_url" => "https://github.com/sboesen/blog.boesen.me/pull/42",
+        "title" => "TEST-1 Needs polish",
+        "pull_request" => %{"url" => "https://api.github.com/repos/sboesen/blog.boesen.me/pulls/42"}
+      },
+      "comment" => %{
+        "html_url" => "https://github.com/sboesen/blog.boesen.me/pull/42#issuecomment-1",
+        "body" => "Please tighten the animation timing."
+      }
+    }
+
+    body = Jason.encode!(payload)
+
+    conn =
+      conn(:post, "/api/v1/github/webhook", body)
+      |> Plug.Conn.assign(:raw_body, body)
+      |> put_req_header("x-github-event", "issue_comment")
+      |> put_req_header("x-hub-signature-256", signature(body))
+
+    assert {:ok,
+            %{handled: true, issue_identifier: "TEST-1", transition: "in_progress", event: "issue_comment"}} =
+             Symphony.GitHubWebhook.handle(conn, payload)
+
+    assert_receive {:mark_started, "TEST-1"}
+  end
+
+  test "moves pull request review comments back to in progress and requests retry" do
+    Process.put(:symphony_tracker_test_pid, self())
+
+    on_exit(fn ->
+      Process.delete(:symphony_tracker_test_pid)
+    end)
+
+    payload = %{
+      "action" => "created",
+      "pull_request" => %{
+        "html_url" => "https://github.com/sboesen/blog.boesen.me/pull/42",
+        "title" => "TEST-1 Needs polish"
+      },
+      "comment" => %{
+        "html_url" => "https://github.com/sboesen/blog.boesen.me/pull/42#discussion_r1",
+        "body" => "Can you simplify this interaction?"
+      }
+    }
+
+    body = Jason.encode!(payload)
+
+    conn =
+      conn(:post, "/api/v1/github/webhook", body)
+      |> Plug.Conn.assign(:raw_body, body)
+      |> put_req_header("x-github-event", "pull_request_review_comment")
+      |> put_req_header("x-hub-signature-256", signature(body))
+
+    assert {:ok,
+            %{handled: true, issue_identifier: "TEST-1", transition: "in_progress", event: "pull_request_review_comment"}} =
+             Symphony.GitHubWebhook.handle(conn, payload)
+
+    assert_receive {:mark_started, "TEST-1"}
+  end
+
+  test "ignores issue comments that are not on pull requests" do
+    payload = %{
+      "action" => "created",
+      "issue" => %{
+        "html_url" => "https://github.com/sboesen/blog.boesen.me/issues/42",
+        "title" => "TEST-1 Needs polish"
+      },
+      "comment" => %{
+        "body" => "This is a regular issue comment."
+      }
+    }
+
+    body = Jason.encode!(payload)
+
+    conn =
+      conn(:post, "/api/v1/github/webhook", body)
+      |> Plug.Conn.assign(:raw_body, body)
+      |> put_req_header("x-github-event", "issue_comment")
+      |> put_req_header("x-hub-signature-256", signature(body))
+
+    assert {:ok, %{handled: false, reason: "not_pull_request_comment"}} =
+             Symphony.GitHubWebhook.handle(conn, payload)
+  end
+
   test "broker falls back to direct webhook handling when no live session matches" do
     payload = %{
       "action" => "closed",
